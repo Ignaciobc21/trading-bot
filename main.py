@@ -201,10 +201,12 @@ def run_features(
             raise ValueError("--features-out debe terminar en .parquet o .csv")
         logger.info("Features guardadas en %s (%d bytes)", p, p.stat().st_size)
 
-    # Resumen estadístico rápido (head + describe) al stdout.
-    print("\n── Primeras filas (no-NaN) ──")
+    # Resumen estadístico rápido (head + describe) al stdout. Usamos ASCII
+    # puro en los títulos para evitar UnicodeEncodeError en consolas Windows
+    # configuradas con cp1252.
+    print("\n-- Primeras filas (no-NaN) --")
     print(dropped.head(3).round(4))
-    print("\n── Resumen estadístico ──")
+    print("\n-- Resumen estadistico --")
     print(dropped.describe().T[["count", "mean", "std", "min", "max"]].round(4))
 
 
