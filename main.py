@@ -182,7 +182,19 @@ def run_features(
         p = Path(out_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         if p.suffix == ".parquet":
-            features.to_parquet(p)
+            try:
+                features.to_parquet(p)
+            except ImportError as exc:
+                fallback = p.with_suffix(".csv")
+                logger.warning(
+                    "pyarrow/fastparquet no disponible (%s). Guardando como CSV en %s.",
+                    exc, fallback,
+                )
+                logger.warning(
+                    "Para habilitar parquet: `pip install -r requirements.txt`  (o `pip install pyarrow`)."
+                )
+                features.to_csv(fallback)
+                p = fallback
         elif p.suffix == ".csv":
             features.to_csv(p)
         else:
