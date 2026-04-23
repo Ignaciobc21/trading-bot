@@ -1,0 +1,26 @@
+# ─── Data & Analysis ───
+pandas>=2.0.0
+numpy>=1.24.0
+yfinance>=0.2.18
+ta>=0.10.2
+
+# ─── Exchange / Broker ───
+# ccxt>=4.0.0
+# python-binance>=1.0.19
+
+# ─── Broker (Alpaca) ───
+alpaca-trade-api>=3.0.0
+
+# ─── Database ───
+sqlalchemy>=2.0.0
+
+# ─── Backtesting ───
+matplotlib>=3.7.0
+
+# ─── Utilities ───
+python-dotenv>=1.0.0
+requests>=2.31.0
+schedule>=1.2.0
+
+# ─── Notifications ───
+python-telegram-bot>=20.0

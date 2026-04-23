@@ -1,0 +1,34 @@
+# ─── Secrets ───
+config/secrets.env
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ─── Virtual env ───
+venv/
+.venv/
+env/
+
+# ─── Database ───
+*.db
+*.sqlite3
+
+# ─── Logs ───
+logs/
+
+# ─── IDE ───
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── OS ───
+.DS_Store
+Thumbs.db
