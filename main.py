@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import time
 import sys
+from pathlib import Path
 from typing import Optional
 
 from config.settings import (
@@ -130,6 +131,69 @@ def run_backtest(
 
     # 6. Graficar
     engine.plot_results(result, save_path=save_plot)
+
+
+# ═══════════════════════════════════════════════
+#  MODO FEATURES  (vuelca el dataset tabular para ML)
+# ═══════════════════════════════════════════════
+def run_features(
+    symbol: str,
+    period: str,
+    interval: str,
+    out_path: Optional[str] = None,
+    include_hurst: bool = True,
+    use_cache: bool = True,
+) -> None:
+    """Descarga datos OHLCV y vuelca el DataFrame de features."""
+    from data.fetcher import DataFetcher
+    from features import FeatureBuilder, FeatureCache, FEATURE_VERSION
+
+    logger.info("═" * 50)
+    logger.info("  MODO FEATURES — %s %s %s (v%s)", symbol, interval, period, FEATURE_VERSION)
+    logger.info("═" * 50)
+
+    df = DataFetcher.fetch_yahoo(ticker=symbol, period=period, interval=interval)
+    if df.empty:
+        logger.error("No se pudieron obtener datos para %s", symbol)
+        sys.exit(1)
+
+    builder = FeatureBuilder(include_hurst=include_hurst)
+
+    def _build():
+        return builder.build(df)
+
+    if use_cache:
+        cache = FeatureCache()
+        features = cache.get_or_build(
+            symbol, interval, period, _build,
+            extra=f"hurst={int(include_hurst)}",
+        )
+    else:
+        features = _build()
+
+    dropped = features.dropna()
+    logger.info(
+        "Features calculadas: shape=%s  filas válidas (dropna)=%d  cols=%d",
+        features.shape, len(dropped), features.shape[1],
+    )
+    logger.info("Columnas: %s", list(features.columns))
+
+    if out_path:
+        p = Path(out_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.suffix == ".parquet":
+            features.to_parquet(p)
+        elif p.suffix == ".csv":
+            features.to_csv(p)
+        else:
+            raise ValueError("--features-out debe terminar en .parquet o .csv")
+        logger.info("Features guardadas en %s (%d bytes)", p, p.stat().st_size)
+
+    # Resumen estadístico rápido (head + describe) al stdout.
+    print("\n── Primeras filas (no-NaN) ──")
+    print(dropped.head(3).round(4))
+    print("\n── Resumen estadístico ──")
+    print(dropped.describe().T[["count", "mean", "std", "min", "max"]].round(4))
 
 
 # ═══════════════════════════════════════════════
@@ -253,9 +317,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["live", "backtest"],
+        choices=["live", "backtest", "features"],
         default="backtest",
-        help="Modo de ejecucion (default: backtest)",
+        help="Modo de ejecucion (default: backtest). 'features' vuelca el DataFrame de features a parquet/CSV.",
     )
     parser.add_argument("--symbol", default="AAPL", help="Simbolo (default: AAPL)")
     parser.add_argument(
@@ -296,6 +360,13 @@ def main() -> None:
                         help="Ruta CSV donde guardar los trades del backtest")
     parser.add_argument("--save-plot", default=None,
                         help="Ruta (png) donde guardar el gráfico del backtest")
+    # ── Parámetros del modo features ──
+    parser.add_argument("--features-out", default=None,
+                        help="Ruta de salida del DataFrame de features (extensión .parquet / .csv)")
+    parser.add_argument("--features-no-hurst", action="store_true",
+                        help="Desactiva el cálculo del exponente de Hurst (caro en series largas)")
+    parser.add_argument("--features-no-cache", action="store_true",
+                        help="Fuerza recálculo (ignora la cache en ~/.cache/trading-bot/features/)")
 
     args = parser.parse_args()
 
@@ -321,6 +392,19 @@ def main() -> None:
             trend_ema_period=args.trend_ema,
             save_trades=args.save_trades,
             save_plot=args.save_plot,
+        )
+    elif args.mode == "features":
+        period = args.period
+        if period is None:
+            period = INTERVAL_MAX_PERIOD.get(args.interval, "1y")
+            logger.info("Periodo auto-seleccionado: %s (max para %s)", period, args.interval)
+        run_features(
+            symbol=args.symbol,
+            period=period,
+            interval=args.interval,
+            out_path=args.features_out,
+            include_hurst=not args.features_no_hurst,
+            use_cache=not args.features_no_cache,
         )
     elif args.mode == "live":
         run_live()

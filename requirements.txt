@@ -3,6 +3,8 @@ pandas>=2.0.0
 numpy>=1.24.0
 yfinance>=0.2.18
 ta>=0.10.2
+# Opcional para cache/vuelco de features en parquet (si falta, se usa pickle).
+pyarrow>=14.0.0
 
 # ─── Exchange / Broker ───
 # ccxt>=4.0.0
