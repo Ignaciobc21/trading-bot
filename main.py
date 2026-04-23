@@ -18,6 +18,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
+
 from config.settings import (
     TRADING_SYMBOL,
     TIMEFRAME,
@@ -43,6 +45,8 @@ def _build_strategy(
     strategy_name: str,
     use_trend_filter: bool,
     trend_ema_period: int,
+    model_path: Optional[str] = None,
+    threshold_override: Optional[float] = None,
 ):
     """Factoría simple de estrategias disponibles en CLI."""
     if strategy_name == "rsi":
@@ -70,6 +74,16 @@ def _build_strategy(
     if strategy_name == "ensemble":
         from strategies.ensemble import build_default_ensemble
         return build_default_ensemble(), 205
+    if strategy_name == "meta_ensemble":
+        if not model_path:
+            raise ValueError("--strategy meta_ensemble requiere --model /ruta/al/modelo.pkl")
+        from strategies.meta_labeled_ensemble import (
+            MetaLabeledEnsembleStrategy,
+        )
+        from ml.meta_labeler import load_meta_labeler
+        infer = load_meta_labeler(model_path)
+        strat = MetaLabeledEnsembleStrategy(inferencer=infer, threshold_override=threshold_override)
+        return strat, 205
     raise ValueError(f"Estrategia desconocida: {strategy_name}")
 
 
@@ -88,6 +102,8 @@ def run_backtest(
     trend_ema_period: int = TREND_EMA_PERIOD,
     save_trades: Optional[str] = None,
     save_plot: Optional[str] = None,
+    model_path: Optional[str] = None,
+    threshold_override: Optional[float] = None,
 ) -> None:
     """Descarga datos y ejecuta un backtest con la estrategia seleccionada."""
     from data.fetcher import DataFetcher
@@ -107,7 +123,10 @@ def run_backtest(
     logger.info("Datos descargados: %d filas [%s → %s]", len(df), df.index[0], df.index[-1])
 
     # 2. Configurar estrategia (vía factoría)
-    strategy, lookback = _build_strategy(strategy_name, use_trend_filter, trend_ema_period)
+    strategy, lookback = _build_strategy(
+        strategy_name, use_trend_filter, trend_ema_period,
+        model_path=model_path, threshold_override=threshold_override,
+    )
 
     # 3. Ejecutar backtest
     engine = BacktestEngine(
@@ -208,6 +227,57 @@ def run_features(
     print(dropped.head(3).round(4))
     print("\n-- Resumen estadistico --")
     print(dropped.describe().T[["count", "mean", "std", "min", "max"]].round(4))
+
+
+# ═══════════════════════════════════════════════
+#  MODO TRAIN (entrena meta-labeler LightGBM)
+# ═══════════════════════════════════════════════
+def run_train(
+    symbol: str,
+    period: str,
+    interval: str,
+    out_path: str,
+    tp_mult: float = 2.0,
+    sl_mult: float = 1.0,
+    max_bars: int = 10,
+) -> None:
+    """Entrena un MetaLabeler LightGBM sobre señales del ensemble y persiste."""
+    from data.fetcher import DataFetcher
+    from ml.meta_labeler import MetaLabelerTrainer, MetaLabelerConfig, save_meta_labeler
+
+    logger.info("═" * 50)
+    logger.info("  MODO TRAIN — %s %s %s  TP=%.2f SL=%.2f Max=%d",
+                symbol, interval, period, tp_mult, sl_mult, max_bars)
+    logger.info("═" * 50)
+
+    df = DataFetcher.fetch_yahoo(ticker=symbol, period=period, interval=interval)
+    if df.empty:
+        logger.error("No se pudieron obtener datos para %s", symbol)
+        sys.exit(1)
+    logger.info("Datos: %d filas [%s → %s]", len(df), df.index[0], df.index[-1])
+
+    cfg = MetaLabelerConfig(tp_mult=tp_mult, sl_mult=sl_mult, max_bars=max_bars)
+    trainer = MetaLabelerTrainer(config=cfg)
+    result = trainer.train(df)
+
+    logger.info("Muestras: %d  |  base_rate global: %.3f",
+                result["n_samples"], result["base_rate_global"])
+    logger.info("Threshold elegido: %.3f", result["threshold"])
+
+    print("\n-- Metricas por fold (walk-forward) --")
+    if result["fold_metrics"]:
+        folds_df = pd.DataFrame(result["fold_metrics"])
+        print(folds_df.round(4).to_string(index=False))
+    else:
+        print("(sin folds — muestras insuficientes para splits internos)")
+
+    print("\n-- Top 15 features por importancia --")
+    top = list(result["feature_importance"].items())[:15]
+    for k, v in top:
+        print(f"  {k:<25}  {v}")
+
+    path = save_meta_labeler(result, out_path)
+    logger.info("Modelo guardado en %s (%d bytes)", path, path.stat().st_size)
 
 
 # ═══════════════════════════════════════════════
@@ -331,16 +401,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["live", "backtest", "features"],
+        choices=["live", "backtest", "features", "train"],
         default="backtest",
-        help="Modo de ejecucion (default: backtest). 'features' vuelca el DataFrame de features a parquet/CSV.",
+        help="Modo de ejecucion (default: backtest). 'features' vuelca el DataFrame; 'train' entrena meta-labeler ML.",
     )
     parser.add_argument("--symbol", default="AAPL", help="Simbolo (default: AAPL)")
     parser.add_argument(
         "--strategy",
-        choices=["rsi", "mfi_rsi", "donchian", "rsi2_mr", "ensemble"],
+        choices=["rsi", "mfi_rsi", "donchian", "rsi2_mr", "ensemble", "meta_ensemble"],
         default="mfi_rsi",
-        help="Estrategia a usar (default: mfi_rsi)",
+        help="Estrategia a usar (default: mfi_rsi). 'meta_ensemble' requiere --model.",
     )
     parser.add_argument(
         "--period",
@@ -381,6 +451,17 @@ def main() -> None:
                         help="Desactiva el cálculo del exponente de Hurst (caro en series largas)")
     parser.add_argument("--features-no-cache", action="store_true",
                         help="Fuerza recálculo (ignora la cache en ~/.cache/trading-bot/features/)")
+    # ── Modo train / meta_ensemble ──
+    parser.add_argument("--model", default=None,
+                        help="Ruta al modelo .pkl (entrada para --strategy meta_ensemble, salida para --mode train)")
+    parser.add_argument("--train-tp-mult", type=float, default=2.0,
+                        help="Multiplicador ATR del take-profit en triple-barrier (default: 2.0)")
+    parser.add_argument("--train-sl-mult", type=float, default=1.0,
+                        help="Multiplicador ATR del stop-loss en triple-barrier (default: 1.0)")
+    parser.add_argument("--train-max-bars", type=int, default=10,
+                        help="Barras máximas antes del timeout en triple-barrier (default: 10)")
+    parser.add_argument("--train-threshold", type=float, default=None,
+                        help="Override del threshold de probabilidad para meta_ensemble (default: threshold entrenado)")
 
     args = parser.parse_args()
 
@@ -406,6 +487,25 @@ def main() -> None:
             trend_ema_period=args.trend_ema,
             save_trades=args.save_trades,
             save_plot=args.save_plot,
+            model_path=args.model,
+            threshold_override=args.train_threshold,
+        )
+    elif args.mode == "train":
+        if not args.model:
+            logger.error("--mode train requiere --model /ruta/salida.pkl")
+            sys.exit(2)
+        period = args.period
+        if period is None:
+            period = INTERVAL_MAX_PERIOD.get(args.interval, "5y")
+            logger.info("Periodo auto-seleccionado: %s (max para %s)", period, args.interval)
+        run_train(
+            symbol=args.symbol,
+            period=period,
+            interval=args.interval,
+            out_path=args.model,
+            tp_mult=args.train_tp_mult,
+            sl_mult=args.train_sl_mult,
+            max_bars=args.train_max_bars,
         )
     elif args.mode == "features":
         period = args.period

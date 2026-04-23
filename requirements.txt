@@ -19,6 +19,11 @@ sqlalchemy>=2.0.0
 # ─── Backtesting ───
 matplotlib>=3.7.0
 
+# ─── Machine Learning (P4 meta-labeling) ───
+lightgbm>=4.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
 # ─── Utilities ───
 python-dotenv>=1.0.0
 requests>=2.31.0
