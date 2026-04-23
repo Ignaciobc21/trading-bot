@@ -64,42 +64,39 @@ class MfiRsiStrategy(BaseStrategy):
         return 100 - (100 / (1 + positive_mf / negative_mf.replace(0, np.nan)))
 
     def generate_signal(self, df: pd.DataFrame) -> StrategySignal:
-        """Evalúa los datos más recientes y devuelve una decisión."""
-        
-        # Validar que hay suficientes datos
-        max_period = max(self.rsi_period, self.mfi_period)
+        max_period = max(self.rsi_period, self.mfi_period) + 1
         if len(df) < max_period:
             return StrategySignal(Action.HOLD, reason="Not enough data")
 
-        # 1. Calcular indicadores (optimizado: solo evaluamos lo necesario si es posible, 
-        # pero aquí calculamos la serie para aplicar tus funciones exactas)
         rsi_series = self._compute_rsi(df['close'])
         mfi_series = self._compute_mfi(df)
 
-        # 2. Extraer el valor de la vela más reciente
         current_rsi = rsi_series.iloc[-1]
+        prev_rsi    = rsi_series.iloc[-2]
         current_mfi = mfi_series.iloc[-1]
+        prev_mfi    = mfi_series.iloc[-2]
         current_price = df['close'].iloc[-1]
 
-        # 3. Lógica de la estrategia (basada en tu código)
-        # RSI es alcista si está entre oversold y overbought
-        rsi_bullish = (current_rsi > self.rsi_oversold) and (current_rsi <= self.rsi_overbought)
-        
-        # MFI es alcista si está entre oversold y overbought
-        mfi_bullish = (current_mfi > self.mfi_oversold) and (current_mfi <= self.mfi_overbought)
+        # BUY: both cross UP from oversold (momentum reversal)
+        rsi_cross_up = (prev_rsi <= self.rsi_oversold) and (current_rsi > self.rsi_oversold)
+        mfi_cross_up = (prev_mfi <= self.mfi_oversold) and (current_mfi > self.mfi_oversold)
 
-        # 4. Generar la señal
-        if rsi_bullish and mfi_bullish:
+        # SELL: either indicator reaches overbought OR crosses down from it
+        rsi_sell = current_rsi >= self.rsi_overbought
+        mfi_sell = current_mfi >= self.mfi_overbought
+
+        if rsi_cross_up and mfi_cross_up:
             return StrategySignal(
-                action=Action.BUY,
-                confidence=0.9,
-                price=current_price,
-                reason=f"RSI ({current_rsi:.1f}) y MFI ({current_mfi:.1f}) en zona alcista"
+                action=Action.BUY, confidence=0.9, price=current_price,
+                reason=f"RSI ({current_rsi:.1f}) and MFI ({current_mfi:.1f}) crossed up from oversold"
             )
-        else:
+        if rsi_sell or mfi_sell:
             return StrategySignal(
-                action=Action.SELL,
-                confidence=0.9,
-                price=current_price,
-                reason=f"Condición rota. RSI: {current_rsi:.1f}, MFI: {current_mfi:.1f}"
+                action=Action.SELL, confidence=0.9, price=current_price,
+                reason=f"RSI ({current_rsi:.1f}) or MFI ({current_mfi:.1f}) hit overbought"
             )
+
+        return StrategySignal(
+            action=Action.HOLD, confidence=0.0, price=current_price,
+            reason=f"RSI={current_rsi:.1f}, MFI={current_mfi:.1f} — no signal"
+        )

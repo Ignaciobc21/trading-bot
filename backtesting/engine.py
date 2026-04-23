@@ -182,7 +182,7 @@ class BacktestEngine:
 
         # Sharpe Ratio (anualizado, asumiendo velas diarias)
         if len(pnls) > 1:
-            returns = pd.Series(pnls)
+            returns = pd.Series([t["return_pct"] / 100 for t in trades])
             sharpe = (returns.mean() / returns.std()) * np.sqrt(252) if returns.std() != 0 else 0.0
         else:
             sharpe = 0.0
