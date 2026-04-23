@@ -38,10 +38,45 @@ logger = get_logger("main")
 # ═══════════════════════════════════════════════
 #  MODO BACKTEST
 # ═══════════════════════════════════════════════
+def _build_strategy(
+    strategy_name: str,
+    use_trend_filter: bool,
+    trend_ema_period: int,
+):
+    """Factoría simple de estrategias disponibles en CLI."""
+    if strategy_name == "rsi":
+        from strategies.rsi_strategy import RSIStrategy
+        return RSIStrategy(), 50
+    if strategy_name == "mfi_rsi":
+        from strategies.mfi_rsi_strategy import MfiRsiStrategy
+        strat = MfiRsiStrategy(
+            rsi_period=14,
+            rsi_oversold=30,
+            rsi_overbought=70,
+            mfi_period=14,
+            mfi_oversold=20,
+            mfi_overbought=80,
+            use_trend_filter=use_trend_filter,
+            trend_ema_period=trend_ema_period,
+        )
+        return strat, max(50, trend_ema_period if use_trend_filter else 0) + 5
+    if strategy_name == "donchian":
+        from strategies.donchian_trend import DonchianTrendStrategy
+        return DonchianTrendStrategy(), 60
+    if strategy_name == "rsi2_mr":
+        from strategies.rsi2_mean_reversion import RSI2MeanReversionStrategy
+        return RSI2MeanReversionStrategy(), 205
+    if strategy_name == "ensemble":
+        from strategies.ensemble import build_default_ensemble
+        return build_default_ensemble(), 205
+    raise ValueError(f"Estrategia desconocida: {strategy_name}")
+
+
 def run_backtest(
     symbol: str,
     period: str,
     interval: str,
+    strategy_name: str = "mfi_rsi",
     position_size_pct: float = 100.0,
     stop_loss_pct: float = 0.0,   # desactivado por defecto en backtest
     take_profit_pct: float = 0.0,
@@ -53,13 +88,12 @@ def run_backtest(
     save_trades: Optional[str] = None,
     save_plot: Optional[str] = None,
 ) -> None:
-    """Descarga datos y ejecuta un backtest con la estrategia MFI+RSI."""
+    """Descarga datos y ejecuta un backtest con la estrategia seleccionada."""
     from data.fetcher import DataFetcher
-    from strategies.mfi_rsi_strategy import MfiRsiStrategy
     from backtesting.engine import BacktestEngine
 
     logger.info("═" * 50)
-    logger.info("  MODO BACKTEST")
+    logger.info("  MODO BACKTEST — strategy=%s", strategy_name)
     logger.info("═" * 50)
 
     # 1. Descargar datos
@@ -71,17 +105,8 @@ def run_backtest(
 
     logger.info("Datos descargados: %d filas [%s → %s]", len(df), df.index[0], df.index[-1])
 
-    # 2. Configurar estrategia
-    strategy = MfiRsiStrategy(
-        rsi_period=14,
-        rsi_oversold=30,
-        rsi_overbought=70,
-        mfi_period=14,
-        mfi_oversold=20,
-        mfi_overbought=80,
-        use_trend_filter=use_trend_filter,
-        trend_ema_period=trend_ema_period,
-    )
+    # 2. Configurar estrategia (vía factoría)
+    strategy, lookback = _build_strategy(strategy_name, use_trend_filter, trend_ema_period)
 
     # 3. Ejecutar backtest
     engine = BacktestEngine(
@@ -94,8 +119,6 @@ def run_backtest(
         take_profit_pct=take_profit_pct,
         max_holding_bars=max_holding_bars,
     )
-    # Lookback suficiente para que la EMA de tendencia esté estable.
-    lookback = max(50, trend_ema_period if use_trend_filter else 0) + 5
     result = engine.run(df, lookback=lookback)
 
     # 4. Mostrar resultados
@@ -236,6 +259,12 @@ def main() -> None:
     )
     parser.add_argument("--symbol", default="AAPL", help="Simbolo (default: AAPL)")
     parser.add_argument(
+        "--strategy",
+        choices=["rsi", "mfi_rsi", "donchian", "rsi2_mr", "ensemble"],
+        default="mfi_rsi",
+        help="Estrategia a usar (default: mfi_rsi)",
+    )
+    parser.add_argument(
         "--period",
         default=None,
         help="Periodo de datos (ej: 7d, 60d, 6mo, 1y, max). Si no se indica, se elige automaticamente.",
@@ -281,6 +310,7 @@ def main() -> None:
             symbol=args.symbol,
             period=period,
             interval=args.interval,
+            strategy_name=args.strategy,
             position_size_pct=args.position_size_pct,
             stop_loss_pct=args.stop_loss_pct,
             take_profit_pct=args.take_profit_pct,
