@@ -63,5 +63,23 @@ class BaseStrategy(ABC):
         """
         ...
 
+    def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Genera una serie de acciones (una por barra) para backtests vectorizados.
+
+        Implementación por defecto: itera barra a barra llamando a
+        `generate_signal`. Las estrategias pueden sobreescribir este método
+        para devolver la serie completa en una sola pasada vectorizada
+        (mucho más rápido en datasets grandes).
+
+        Returns:
+            pd.Series indexada como df, con valores Action (BUY/SELL/HOLD).
+        """
+        actions = []
+        for i in range(len(df)):
+            window = df.iloc[: i + 1]
+            actions.append(self.generate_signal(window).action)
+        return pd.Series(actions, index=df.index, name="action")
+
     def __repr__(self) -> str:
         return f"<Strategy: {self.name}>"

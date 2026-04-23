@@ -15,8 +15,21 @@ from __future__ import annotations
 import argparse
 import time
 import sys
+from typing import Optional
 
-from config.settings import TRADING_SYMBOL, TIMEFRAME, INITIAL_CAPITAL
+from config.settings import (
+    TRADING_SYMBOL,
+    TIMEFRAME,
+    INITIAL_CAPITAL,
+    STOP_LOSS_PCT,
+    TAKE_PROFIT_PCT,
+    MAX_POSITION_SIZE_PCT,
+    SLIPPAGE_PCT,
+    COMMISSION_PCT,
+    MAX_HOLDING_BARS,
+    USE_TREND_FILTER,
+    TREND_EMA_PERIOD,
+)
 from utils.logger import get_logger
 
 logger = get_logger("main")
@@ -25,10 +38,23 @@ logger = get_logger("main")
 # ═══════════════════════════════════════════════
 #  MODO BACKTEST
 # ═══════════════════════════════════════════════
-def run_backtest(symbol: str, period: str, interval: str) -> None:
-    """Descarga datos y ejecuta un backtest con la estrategia RSI."""
+def run_backtest(
+    symbol: str,
+    period: str,
+    interval: str,
+    position_size_pct: float = 100.0,
+    stop_loss_pct: float = 0.0,   # desactivado por defecto en backtest
+    take_profit_pct: float = 0.0,
+    slippage_pct: float = SLIPPAGE_PCT,
+    commission_pct: float = COMMISSION_PCT,
+    max_holding_bars: int = 0,
+    use_trend_filter: bool = False,
+    trend_ema_period: int = TREND_EMA_PERIOD,
+    save_trades: Optional[str] = None,
+    save_plot: Optional[str] = None,
+) -> None:
+    """Descarga datos y ejecuta un backtest con la estrategia MFI+RSI."""
     from data.fetcher import DataFetcher
-    from strategies.rsi_strategy import RSIStrategy
     from strategies.mfi_rsi_strategy import MfiRsiStrategy
     from backtesting.engine import BacktestEngine
 
@@ -46,21 +72,41 @@ def run_backtest(symbol: str, period: str, interval: str) -> None:
     logger.info("Datos descargados: %d filas [%s → %s]", len(df), df.index[0], df.index[-1])
 
     # 2. Configurar estrategia
-    # strategy = RSIStrategy(rsi_period=14, oversold=30, overbought=70)
-    strategy = MfiRsiStrategy(rsi_period=14, rsi_oversold=30, rsi_overbought=70, mfi_period=14, mfi_oversold=20, mfi_overbought=80)
+    strategy = MfiRsiStrategy(
+        rsi_period=14,
+        rsi_oversold=30,
+        rsi_overbought=70,
+        mfi_period=14,
+        mfi_oversold=20,
+        mfi_overbought=80,
+        use_trend_filter=use_trend_filter,
+        trend_ema_period=trend_ema_period,
+    )
 
     # 3. Ejecutar backtest
     engine = BacktestEngine(
         strategy=strategy,
         initial_capital=INITIAL_CAPITAL,
+        commission_pct=commission_pct,
+        slippage_pct=slippage_pct,
+        position_size_pct=position_size_pct,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        max_holding_bars=max_holding_bars,
     )
-    result = engine.run(df, lookback=50)
+    # Lookback suficiente para que la EMA de tendencia esté estable.
+    lookback = max(50, trend_ema_period if use_trend_filter else 0) + 5
+    result = engine.run(df, lookback=lookback)
 
     # 4. Mostrar resultados
     print(result.summary())
 
-    # 5. Graficar
-    engine.plot_results(result)
+    # 5. Persistencia opcional
+    if save_trades:
+        engine.save_trades_csv(result, save_trades)
+
+    # 6. Graficar
+    engine.plot_results(result, save_path=save_plot)
 
 
 # ═══════════════════════════════════════════════
@@ -200,6 +246,27 @@ def main() -> None:
         choices=list(INTERVAL_MAX_PERIOD.keys()),
         help="Intervalo de vela (default: 1d)",
     )
+    # ── Parámetros de riesgo / ejecución (backtest) ──
+    parser.add_argument("--position-size-pct", type=float, default=100.0,
+                        help="Tamaño de posición como %% del capital (default: 100; usa 2.0 para replicar live)")
+    parser.add_argument("--stop-loss-pct", type=float, default=0.0,
+                        help="Stop-loss en %% del precio de entrada (default: 0 = desactivado)")
+    parser.add_argument("--take-profit-pct", type=float, default=0.0,
+                        help="Take-profit en %% del precio de entrada (default: 0 = desactivado)")
+    parser.add_argument("--slippage-pct", type=float, default=SLIPPAGE_PCT,
+                        help=f"Slippage aplicado en cada fill (default: {SLIPPAGE_PCT}%%)")
+    parser.add_argument("--commission-pct", type=float, default=COMMISSION_PCT,
+                        help=f"Comisión por operación (default: {COMMISSION_PCT}%%)")
+    parser.add_argument("--max-holding-bars", type=int, default=MAX_HOLDING_BARS,
+                        help="Máximo de barras en posición (0 = ilimitado)")
+    parser.add_argument("--trend-filter", action="store_true",
+                        help="Activa el filtro EMA de tendencia (solo longs cuando precio > EMA)")
+    parser.add_argument("--trend-ema", type=int, default=TREND_EMA_PERIOD,
+                        help=f"Periodo de la EMA del filtro de tendencia (default: {TREND_EMA_PERIOD})")
+    parser.add_argument("--save-trades", default=None,
+                        help="Ruta CSV donde guardar los trades del backtest")
+    parser.add_argument("--save-plot", default=None,
+                        help="Ruta (png) donde guardar el gráfico del backtest")
 
     args = parser.parse_args()
 
@@ -210,7 +277,21 @@ def main() -> None:
             period = INTERVAL_MAX_PERIOD.get(args.interval, "1y")
             logger.info("Periodo auto-seleccionado: %s (max para %s)", period, args.interval)
 
-        run_backtest(symbol=args.symbol, period=period, interval=args.interval)
+        run_backtest(
+            symbol=args.symbol,
+            period=period,
+            interval=args.interval,
+            position_size_pct=args.position_size_pct,
+            stop_loss_pct=args.stop_loss_pct,
+            take_profit_pct=args.take_profit_pct,
+            slippage_pct=args.slippage_pct,
+            commission_pct=args.commission_pct,
+            max_holding_bars=args.max_holding_bars,
+            use_trend_filter=args.trend_filter or USE_TREND_FILTER,
+            trend_ema_period=args.trend_ema,
+            save_trades=args.save_trades,
+            save_plot=args.save_plot,
+        )
     elif args.mode == "live":
         run_live()
 

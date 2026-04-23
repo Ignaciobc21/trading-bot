@@ -62,3 +62,7 @@ LOG_FILE = BASE_DIR / "logs" / "trading_bot.log"
 # ──────────────────────────────────────────────
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "10000.0"))
 COMMISSION_PCT = float(os.getenv("COMMISSION_PCT", "0.0"))  # Alpaca es commission-free
+SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.02"))     # % del precio (2 bps por defecto)
+MAX_HOLDING_BARS = int(os.getenv("MAX_HOLDING_BARS", "0"))  # 0 = sin límite
+USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "false").lower() in ("1", "true", "yes")
+TREND_EMA_PERIOD = int(os.getenv("TREND_EMA_PERIOD", "50"))
