@@ -286,6 +286,8 @@ def run_train(
     symbols: Optional[list] = None,
     regime_split: bool = False,
     threshold_objective: str = "sharpe",
+    cv_method: str = "walk_forward",
+    purge_bars: Optional[int] = None,
 ) -> None:
     """Entrena un MetaLabeler LightGBM sobre señales del ensemble y persiste.
 
@@ -305,9 +307,9 @@ def run_train(
     if regime_split:
         tag.append("REGIME-SPLIT")
     label = " ".join(tag) if tag else "SINGLE"
-    logger.info("  MODO TRAIN [%s] — %s %s %s  TP=%.2f SL=%.2f Max=%d  thr-obj=%s",
+    logger.info("  MODO TRAIN [%s] — %s %s %s  TP=%.2f SL=%.2f Max=%d  thr-obj=%s  cv=%s",
                 label, symbol or "basket", interval, period, tp_mult, sl_mult, max_bars,
-                threshold_objective)
+                threshold_objective, cv_method)
     logger.info("═" * 50)
 
     if regime_split and not symbols:
@@ -319,6 +321,8 @@ def run_train(
         sl_mult=sl_mult,
         max_bars=max_bars,
         threshold_objective=threshold_objective,
+        cv_method=cv_method,
+        purge_bars=purge_bars,
     )
     trainer = MetaLabelerTrainer(config=cfg)
 
@@ -354,7 +358,7 @@ def run_train(
                 "Regimen %-11s : %d muestras  base_rate=%.3f  thr=%.3f",
                 name, sub["n_samples"], sub["base_rate_global"], sub["threshold"],
             )
-            print(f"\n-- [{name}] Metricas por fold (walk-forward) --")
+            print(f"\n-- [{name}] Metricas por fold (cv={cv_method}) --")
             if sub["fold_metrics"]:
                 print(pd.DataFrame(sub["fold_metrics"]).round(4).to_string(index=False))
             else:
@@ -369,7 +373,7 @@ def run_train(
         if result.get("samples_per_symbol"):
             logger.info("Muestras por simbolo: %s", result["samples_per_symbol"])
 
-        print("\n-- Metricas por fold (walk-forward) --")
+        print(f"\n-- Metricas por fold (cv={cv_method}) --")
         if result["fold_metrics"]:
             folds_df = pd.DataFrame(result["fold_metrics"])
             print(folds_df.round(4).to_string(index=False))
@@ -667,6 +671,16 @@ def main() -> None:
                         help="D: criterio de elección del threshold del meta-modelo. "
                              "'sharpe' (default) maximiza Sharpe de los retornos realizados; "
                              "'f1' replica el comportamiento previo (max F1 de clasificación).")
+    # ── F: CV method ──
+    parser.add_argument("--cv-method", choices=["walk_forward", "purged_kfold"], default="walk_forward",
+                        help="F: método de validación cruzada del meta-labeler. "
+                             "'walk_forward' (default, expanding window con embargo). "
+                             "'purged_kfold' (López de Prado: K folds disjuntos con purging+embargo). "
+                             "purged_kfold da métricas CV más honestas pero rompe la asimetría temporal — "
+                             "útil para auditar overfit, no para deploys finales.")
+    parser.add_argument("--purge-bars", type=int, default=None,
+                        help="F: barras a purgar antes de cada test fold en --cv-method purged_kfold "
+                             "(default: igual a --train-max-bars, el horizonte del triple-barrier).")
     # ── P6: Risk overlay ──
     parser.add_argument("--risk-overlay", action="store_true",
                         help="P6: activa el risk overlay (vol targeting + regime + confidence sizing).")
@@ -751,6 +765,8 @@ def main() -> None:
             symbols=symbols_list,
             regime_split=args.regime_split,
             threshold_objective=args.threshold_objective,
+            cv_method=args.cv_method,
+            purge_bars=args.purge_bars,
         )
     elif args.mode == "features":
         period = args.period
