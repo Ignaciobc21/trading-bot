@@ -32,3 +32,15 @@ logs/
 # ─── OS ───
 .DS_Store
 Thumbs.db
+
+# ─── ML artefactos (se regeneran con --mode train) ───
+models/
+*.pkl
+*.joblib
+
+# ─── Ficheros temporales de merge tools ───
+*_BACKUP_*.py
+*_BASE_*.py
+*_LOCAL_*.py
+*_REMOTE_*.py
+*.orig
