@@ -39,7 +39,18 @@ class MetaLabeledEnsembleStrategy(BaseStrategy):
     ):
         self.inferencer = inferencer
         self.base = base or build_default_ensemble()
-        self.feature_builder = feature_builder or FeatureBuilder()
+        # Si el modelo entrenado usaba features de sentimiento, el
+        # FeatureBuilder de inferencia tiene que producirlas también
+        # (sino faltarían columnas y `predict_proba` falla por shape).
+        # Se detecta por prefijos "news_" / "fng_" en `feature_cols`.
+        needs_sentiment = self._needs_sentiment(inferencer)
+        self.feature_builder = feature_builder or FeatureBuilder(
+            include_sentiment=needs_sentiment
+        )
+        # Si el caller pasó un FeatureBuilder propio pero el modelo
+        # requiere sentiment, lo activamos aquí también.
+        if needs_sentiment and not self.feature_builder.include_sentiment:
+            self.feature_builder.include_sentiment = True
         self._is_split = isinstance(inferencer, RegimeSplitInferencer)
         # Solo aplicable al modelo global. En modo split cada sub-modelo
         # lleva su propio threshold calibrado por fold.
@@ -50,6 +61,22 @@ class MetaLabeledEnsembleStrategy(BaseStrategy):
         )
         tag = "split" if self._is_split else f"thr={self.threshold:.2f}"
         self.name = f"MetaLabeled[{self.base.name}] {tag}"
+
+    @staticmethod
+    def _needs_sentiment(inferencer: AnyInferencer) -> bool:
+        """
+        Heurística por nombre de columna: si las features del modelo
+        contienen alguna que empiece por "news_" o "fng_", el modelo se
+        entrenó con sentiment activado y la inferencia tiene que
+        producir las mismas columnas para no romper.
+        """
+        if isinstance(inferencer, RegimeSplitInferencer):
+            cols: list[str] = []
+            for sub in inferencer.sub.values():
+                cols.extend(sub.feature_cols)
+        else:
+            cols = list(getattr(inferencer, "feature_cols", []) or [])
+        return any(c.startswith("news_") or c.startswith("fng_") for c in cols)
 
     # ──────────────────────────────────────────
     def _feature_cols(self) -> list[str]:
@@ -66,6 +93,19 @@ class MetaLabeledEnsembleStrategy(BaseStrategy):
             return cols
         return self.inferencer.feature_cols
 
+    def _required_feature_cols(self) -> list[str]:
+        """
+        Subset de `_feature_cols()` que se EXIGE estar no-NaN en una
+        barra para no rechazarla. Las features de sentimiento (`news_*`,
+        `fng_*`) pueden ser legítimamente NaN cuando no hay cobertura
+        — LightGBM las maneja nativamente, no son razón para rechazar
+        un BUY a ciegas.
+        """
+        return [
+            c for c in self._feature_cols()
+            if not (c.startswith("news_") or c.startswith("fng_"))
+        ]
+
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         if self._is_split:
             base_actions, sources = self.base.generate_signals_with_source(df)
@@ -78,7 +118,10 @@ class MetaLabeledEnsembleStrategy(BaseStrategy):
         buy_mask = base_actions == Action.BUY
         buy_idx = df.index[buy_mask]
         feats_buy = features.loc[buy_idx]
-        valid_mask = feats_buy[self._feature_cols()].notna().all(axis=1)
+        # Sólo exigimos non-NaN en las features TÉCNICAS — las de
+        # sentimiento pueden ser NaN sin penalizar (LightGBM las
+        # interpreta como rama "missing").
+        valid_mask = feats_buy[self._required_feature_cols()].notna().all(axis=1)
         valid_idx = feats_buy.index[valid_mask]
 
         if len(valid_idx) > 0:
@@ -123,7 +166,7 @@ class MetaLabeledEnsembleStrategy(BaseStrategy):
             return out
 
         feats_buy = features.loc[buy_idx]
-        valid_mask = feats_buy[self._feature_cols()].notna().all(axis=1)
+        valid_mask = feats_buy[self._required_feature_cols()].notna().all(axis=1)
         valid_idx = feats_buy.index[valid_mask]
         if len(valid_idx) == 0:
             return out

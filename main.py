@@ -126,6 +126,10 @@ def run_backtest(
         logger.error("No se pudieron obtener datos para %s", symbol)
         sys.exit(1)
 
+    # Anotar el símbolo en el DataFrame para que las features de
+    # sentimiento (si el modelo las usa) sepan a qué ticker pedir noticias.
+    df.attrs["symbol"] = symbol
+
     logger.info("Datos descargados: %d filas [%s → %s]", len(df), df.index[0], df.index[-1])
 
     # 2. Configurar estrategia (vía factoría)
@@ -205,24 +209,31 @@ def run_features(
     out_path: Optional[str] = None,
     include_hurst: bool = True,
     use_cache: bool = True,
+    include_sentiment: bool = False,
 ) -> None:
     """Descarga datos OHLCV y vuelca el DataFrame de features."""
     from data.fetcher import DataFetcher
     from features import FeatureBuilder, FeatureCache, FEATURE_VERSION
 
     logger.info("═" * 50)
-    logger.info("  MODO FEATURES — %s %s %s (v%s)", symbol, interval, period, FEATURE_VERSION)
+    logger.info("  MODO FEATURES — %s %s %s (v%s)  sentiment=%s",
+                symbol, interval, period, FEATURE_VERSION, include_sentiment)
     logger.info("═" * 50)
 
     df = DataFetcher.fetch_yahoo(ticker=symbol, period=period, interval=interval)
     if df.empty:
         logger.error("No se pudieron obtener datos para %s", symbol)
         sys.exit(1)
+    # Anotar el símbolo para que sentiment lo encuentre.
+    df.attrs["symbol"] = symbol
 
-    builder = FeatureBuilder(include_hurst=include_hurst)
+    builder = FeatureBuilder(
+        include_hurst=include_hurst,
+        include_sentiment=include_sentiment,
+    )
 
     def _build():
-        return builder.build(df)
+        return builder.build(df, symbol=symbol)
 
     if use_cache:
         cache = FeatureCache()
@@ -288,6 +299,7 @@ def run_train(
     threshold_objective: str = "sharpe",
     cv_method: str = "walk_forward",
     purge_bars: Optional[int] = None,
+    include_sentiment: bool = False,
 ) -> None:
     """Entrena un MetaLabeler LightGBM sobre señales del ensemble y persiste.
 
@@ -298,6 +310,7 @@ def run_train(
           entrena DOS modelos (trend-follow / mean-revert) en un único payload.
     """
     from data.fetcher import DataFetcher
+    from features import FeatureBuilder
     from ml.meta_labeler import MetaLabelerTrainer, MetaLabelerConfig, save_meta_labeler
 
     logger.info("═" * 50)
@@ -324,7 +337,13 @@ def run_train(
         cv_method=cv_method,
         purge_bars=purge_bars,
     )
-    trainer = MetaLabelerTrainer(config=cfg)
+    # B (sentiment): el FeatureBuilder se construye aquí para poder
+    # inyectar `include_sentiment`. Si está activo, las columnas
+    # `news_*` y `fng_*` se añaden al dataset y quedan codificadas en
+    # `feature_cols` del payload — la inferencia las detecta y activa
+    # automáticamente el mismo modo (ver MetaLabeledEnsembleStrategy).
+    fb = FeatureBuilder(include_sentiment=include_sentiment)
+    trainer = MetaLabelerTrainer(config=cfg, feature_builder=fb)
 
     if symbols:
         dfs = {}
@@ -346,7 +365,7 @@ def run_train(
             logger.error("No se pudieron obtener datos para %s", symbol)
             sys.exit(1)
         logger.info("Datos: %d filas [%s → %s]", len(df), df.index[0], df.index[-1])
-        result = trainer.train(df)
+        result = trainer.train(df, symbol=symbol)
 
     if result.get("kind") == "regime_split":
         # Reporting específico para el payload per-régimen.
@@ -681,6 +700,12 @@ def main() -> None:
     parser.add_argument("--purge-bars", type=int, default=None,
                         help="F: barras a purgar antes de cada test fold en --cv-method purged_kfold "
                              "(default: igual a --train-max-bars, el horizonte del triple-barrier).")
+    # ── B: Sentiment ──
+    parser.add_argument("--include-sentiment", action="store_true",
+                        help="B: añade features de sentimiento al pipeline (VADER sobre yfinance "
+                             "news + crypto Fear & Greed). Sin keys externas. NaN para barras sin "
+                             "cobertura. La inferencia detecta automáticamente si el modelo "
+                             "guardado fue entrenado con sentiment y activa el modo correspondiente.")
     # ── P6: Risk overlay ──
     parser.add_argument("--risk-overlay", action="store_true",
                         help="P6: activa el risk overlay (vol targeting + regime + confidence sizing).")
@@ -767,6 +792,7 @@ def main() -> None:
             threshold_objective=args.threshold_objective,
             cv_method=args.cv_method,
             purge_bars=args.purge_bars,
+            include_sentiment=args.include_sentiment,
         )
     elif args.mode == "features":
         period = args.period
@@ -780,6 +806,7 @@ def main() -> None:
             out_path=args.features_out,
             include_hurst=not args.features_no_hurst,
             use_cache=not args.features_no_cache,
+            include_sentiment=args.include_sentiment,
         )
     elif args.mode == "live":
         run_live(

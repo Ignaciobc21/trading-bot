@@ -28,7 +28,8 @@ from strategies.regime import adx, atr, rolling_hurst
 
 # Versión del conjunto de features. Incrementar si cambia cualquier fórmula
 # o se añaden columnas (invalida caches en disco).
-FEATURE_VERSION = "1.0.0"
+# 1.1.0 — añadidas features opcionales de sentimiento (ver `include_sentiment`).
+FEATURE_VERSION = "1.1.0"
 
 
 # ──────────────────────────────────────────────
@@ -144,16 +145,29 @@ class FeatureBuilder:
     hurst_window: int = 100
     include_calendar: bool = True
     include_hurst: bool = True  # caro en series largas; opcional desactivar.
+    # ── B (sentiment): si True, añade features de sentimiento al DataFrame
+    # de salida. Requiere conocer el símbolo, que se pasa por
+    # `df.attrs["symbol"]` o por el parámetro `symbol` de `build()`.
+    # Las features añadidas viven en `features/sentiment.py` (VADER sobre
+    # yfinance news + crypto Fear&Greed). NaN cuando no hay cobertura;
+    # LightGBM las maneja sin problema.
+    include_sentiment: bool = False
 
     # ──────────────────────────────────────────
     # API pública
     # ──────────────────────────────────────────
-    def build(self, df: pd.DataFrame) -> pd.DataFrame:
+    def build(self, df: pd.DataFrame, symbol: Optional[str] = None) -> pd.DataFrame:
         """
         Construye el DataFrame de features a partir de OHLCV. Conserva el
         índice de `df`. NO incluye precio/volumen crudos como features
         (esos se mantienen en el DataFrame original; el caller puede hacer
         join si los quiere).
+
+        Args:
+            df     : OHLCV con columnas open, high, low, close, volume.
+            symbol : ticker para las features de sentimiento. Si no se
+                     pasa, se intenta leer de `df.attrs["symbol"]`.
+                     Sólo se usa si `include_sentiment=True`.
         """
         self._validate(df)
         out = {}
@@ -168,6 +182,17 @@ class FeatureBuilder:
             out.update(self._calendar_features(df))
 
         features = pd.DataFrame(out, index=df.index)
+
+        # ── Sentiment (opcional, B) ─────────────────────────────────────
+        if self.include_sentiment:
+            sym = symbol or df.attrs.get("symbol")
+            # Import perezoso para no cargar VADER ni tocar el filesystem
+            # si nadie pidió sentiment.
+            from features.sentiment import SentimentFeatureBuilder
+            sent_builder = SentimentFeatureBuilder()
+            sent_feats = sent_builder.build(features.index, symbol=sym)
+            # Concat por columnas — el índice ya coincide.
+            features = pd.concat([features, sent_feats], axis=1)
         # Nada de datos de futuro: todas las features se calculan hasta
         # (inclusive) la barra actual. Si queremos "features al cierre de
         # t-1 usadas para predecir t", el shift(1) lo hace el consumidor

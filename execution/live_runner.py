@@ -407,6 +407,11 @@ class LiveRunner:
 
         # 1. Descargar histórico reciente.
         df = self._fetch_bars()
+        if df is not None and not df.empty:
+            # Anotar el símbolo en el DataFrame: las features de
+            # sentimiento (B) lo leen vía `df.attrs["symbol"]` para
+            # decidir qué noticias buscar. No afecta a nada más.
+            df.attrs["symbol"] = cfg.symbol
         if df is None or df.empty:
             logger.warning("Sin datos recientes — SKIP.")
             return LiveDecision(
