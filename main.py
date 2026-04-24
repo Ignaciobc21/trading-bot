@@ -388,79 +388,169 @@ def run_train(
 # ═══════════════════════════════════════════════
 #  MODO LIVE
 # ═══════════════════════════════════════════════
-def run_live() -> None:
-    """Ejecuta el bot en modo live con la estrategia RSI."""
-    from data.fetcher import DataFetcher
-    from data.storage import StorageManager
-    from strategies.rsi_strategy import RSIStrategy
-    from execution.broker import Broker
-    from execution.orders import OrderManager
-    from risk.manager import RiskManager
-    from utils.helpers import send_telegram_message, build_trade_alert
+def run_live(
+    symbol: str = TRADING_SYMBOL,
+    timeframe: str = TIMEFRAME,
+    strategy_name: str = "meta_ensemble",
+    model_path: Optional[str] = None,
+    threshold_override: Optional[float] = None,
+    dry_run: bool = False,
+    data_source: str = "alpaca",
+    risk_overlay: bool = False,
+    target_vol: float = 0.20,
+    max_daily_loss_pct: float = 0.0,
+    disable_confidence_sizing: bool = False,
+    base_position_size_pct: float = 2.0,
+    stop_loss_pct: float = 0.0,
+    take_profit_pct: float = 0.0,
+    max_iters: Optional[int] = None,
+    sleep_seconds: Optional[int] = None,
+) -> None:
+    """
+    Ejecuta el bot en modo live o paper trading.
+
+    El "live" real requiere credenciales Alpaca en `config/secrets.env`. Con
+    `dry_run=True` se puede validar la señal y el sizing sin enviar órdenes
+    (y sin necesitar conexión Alpaca si `data_source="yahoo"`).
+
+    Args:
+        symbol              : ticker (ej. "AAPL", "BTC-USD").
+        timeframe           : granularidad Alpaca-style (1Min/5Min/15Min/1Hour/1Day).
+        strategy_name       : ensemble, meta_ensemble, rsi, mfi_rsi, donchian, rsi2_mr.
+        model_path          : .pkl del meta-modelo (requerido para meta_ensemble).
+        threshold_override  : override del threshold del meta-modelo global.
+        dry_run             : si True, no envía órdenes (sólo logging).
+        data_source         : "alpaca" (tiempo real) o "yahoo" (delay, free).
+        risk_overlay        : activa el overlay (vol targeting + regime + confidence).
+        target_vol          : vol anualizada objetivo para el overlay.
+        max_daily_loss_pct  : kill-switch diario (%, 0 = off).
+        disable_confidence_sizing : desactiva el componente de confidence en el overlay.
+        base_position_size_pct   : % del capital base por trade (antes del multiplier).
+        stop_loss_pct / take_profit_pct : % SL/TP intra-barra (0 = off).
+        max_iters           : para testing; None = loop infinito.
+        sleep_seconds       : override del intervalo entre iteraciones.
+    """
+    # Imports locales para no arrastrar deps si nunca se usa `live`.
+    from execution.live_runner import LiveConfig, LiveRunner
+    from strategies.ensemble import build_default_ensemble
+    from strategies.donchian_trend import DonchianTrendStrategy
+    from strategies.rsi2_mean_reversion import RSI2MeanReversionStrategy
+    from strategies.meta_labeled_ensemble import build_meta_labeled_ensemble_from_file
 
     logger.info("═" * 50)
-    logger.info("  MODO LIVE TRADING")
+    logger.info("  MODO LIVE TRADING — %s %s  strategy=%s  dry_run=%s",
+                symbol, timeframe, strategy_name, dry_run)
     logger.info("═" * 50)
 
-    # Inicializar componentes
-    broker = Broker()
-    storage = StorageManager()
-    risk_mgr = RiskManager()
-    order_mgr = OrderManager(broker, storage, risk_mgr)
-    strategy = RSIStrategy()
-    fetcher = DataFetcher(alpaca_api=broker.api)
+    # ── Construir la estrategia ─────────────────────────────────────────
+    if strategy_name == "meta_ensemble":
+        if not model_path:
+            logger.error("--strategy meta_ensemble requiere --model")
+            sys.exit(1)
+        strategy = build_meta_labeled_ensemble_from_file(model_path)
+        if threshold_override is not None and hasattr(strategy, "threshold"):
+            # El override es una red de seguridad: permite endurecer el
+            # filtro en caliente sin retrain (ej. si el mercado cambió).
+            strategy.threshold = float(threshold_override)
+    elif strategy_name == "ensemble":
+        strategy = build_default_ensemble()
+    elif strategy_name == "donchian":
+        strategy = DonchianTrendStrategy()
+    elif strategy_name == "rsi2_mr":
+        strategy = RSI2MeanReversionStrategy()
+    elif strategy_name == "mfi_rsi":
+        from strategies.mfi_rsi_strategy import MfiRsiStrategy
+        strategy = MfiRsiStrategy()
+    else:
+        # Fallback al path histórico del bot (RSIStrategy).
+        from strategies.rsi_strategy import RSIStrategy
+        strategy = RSIStrategy()
 
-    send_telegram_message(f"🤖 <b>Trading Bot iniciado</b>\n"
-                          f"Símbolo: {TRADING_SYMBOL}\nTimeframe: {TIMEFRAME}")
+    # ── Broker / storage ────────────────────────────────────────────────
+    # Si estamos en dry_run Y usamos Yahoo como data source, no hace falta
+    # ni siquiera abrir conexión Alpaca — útil para validar en máquinas
+    # sin credenciales.
+    broker = None
+    storage = None
+    risk_mgr = None
+    if not (dry_run and data_source == "yahoo"):
+        from execution.broker import Broker
+        from data.storage import StorageManager
+        from risk.manager import RiskManager
+        try:
+            broker = Broker()
+            storage = StorageManager()
+            risk_mgr = RiskManager()
+        except Exception as exc:
+            logger.error("No se pudo inicializar Broker/Storage: %s", exc)
+            if not dry_run:
+                sys.exit(1)
 
-    logger.info("Bot iniciado — Símbolo: %s  Timeframe: %s", TRADING_SYMBOL, TIMEFRAME)
+    # ── Risk overlay (opcional) ─────────────────────────────────────────
+    overlay = None
+    if risk_overlay:
+        from risk.overlay import RiskConfig, RiskOverlay
+        overlay_cfg = RiskConfig(
+            target_vol=target_vol,
+            max_daily_loss_pct=max_daily_loss_pct,
+            use_confidence_sizing=not disable_confidence_sizing,
+        )
+        overlay = RiskOverlay(config=overlay_cfg)
+        logger.info(
+            "  RISK OVERLAY ACTIVO — target_vol=%.2f daily_loss=%.1f%% conf_sizing=%s",
+            target_vol, max_daily_loss_pct, not disable_confidence_sizing,
+        )
+
+    # ── Telegram (notificaciones) ───────────────────────────────────────
+    try:
+        from utils.helpers import send_telegram_message
+        telegram_fn = send_telegram_message
+    except Exception:
+        telegram_fn = None
+
+    # ── Config del runner ───────────────────────────────────────────────
+    # Mapeo de intervalos "Yahoo-style" (1d, 1h) a "Alpaca-style" para que
+    # el usuario pueda pasar lo mismo que en backtest.
+    yahoo_interval = "1h" if timeframe == "1Hour" else (
+        "1d" if timeframe == "1Day" else "1h"
+    )
+
+    cfg = LiveConfig(
+        symbol=symbol,
+        timeframe=timeframe,
+        data_source=data_source,
+        dry_run=dry_run,
+        base_position_size_pct=base_position_size_pct,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        max_iters=max_iters,
+        sleep_seconds=sleep_seconds,
+        yahoo_interval=yahoo_interval,
+    )
+
+    runner = LiveRunner(
+        strategy=strategy,
+        config=cfg,
+        broker=broker,
+        storage=storage,
+        risk_mgr=risk_mgr,
+        overlay=overlay,
+        telegram_fn=telegram_fn,
+    )
+
+    if telegram_fn and not dry_run:
+        telegram_fn(f"🤖 <b>Trading Bot iniciado</b>\n"
+                    f"Symbol: {symbol}  TF: {timeframe}\n"
+                    f"Strategy: {strategy.name}")
 
     try:
-        while True:
-            # 1. Obtener datos recientes
-            df = fetcher.fetch_alpaca(symbol=TRADING_SYMBOL, timeframe=TIMEFRAME)
-
-            # 2. Generar señal
-            signal = strategy.generate_signal(df)
-            logger.info("Señal: %s", signal)
-
-            # 3. Actuar según la señal
-            if signal.action.value == "BUY":
-                trade = order_mgr.open_position(
-                    symbol=TRADING_SYMBOL,
-                    side="buy",
-                    strategy_name=strategy.name,
-                )
-                if trade:
-                    alert = build_trade_alert("BUY", TRADING_SYMBOL, signal.price, strategy.name)
-                    send_telegram_message(alert)
-
-            elif signal.action.value == "SELL":
-                open_trades = storage.get_open_trades(symbol=TRADING_SYMBOL)
-                for trade in open_trades:
-                    order_mgr.close_position(trade, signal.price)
-                    alert = build_trade_alert("SELL", TRADING_SYMBOL, signal.price, strategy.name)
-                    send_telegram_message(alert)
-
-            # 4. Revisar SL/TP de posiciones abiertas
-            current_price = fetcher.get_current_price(TRADING_SYMBOL)
-            for trade in storage.get_open_trades(TRADING_SYMBOL):
-                order_mgr.check_exit_conditions(trade, current_price)
-
-            # 5. Esperar hasta la siguiente vela
-            sleep_map = {
-                "1Min": 60, "5Min": 300, "15Min": 900,
-                "1Hour": 3600, "4Hour": 14400, "1Day": 86400,
-            }
-            wait = sleep_map.get(TIMEFRAME, 3600)
-            logger.info("Esperando %d segundos hasta la siguiente vela...", wait)
-            time.sleep(wait)
-
-    except KeyboardInterrupt:
-        logger.info("Bot detenido por el usuario")
-        send_telegram_message("🛑 <b>Trading Bot detenido</b>")
+        runner.run()
     finally:
-        storage.close()
+        if storage is not None:
+            try:
+                storage.close()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════
@@ -590,6 +680,21 @@ def main() -> None:
                         help="Desactiva el escalado por régimen dentro del risk overlay.")
     parser.add_argument("--no-confidence-sizing", action="store_true",
                         help="Desactiva el escalado por confianza del meta-modelo.")
+    # ── E: Live / paper trading ──
+    parser.add_argument("--live-timeframe", default=TIMEFRAME,
+                        help=f"E: timeframe Alpaca-style para --mode live (default: {TIMEFRAME}). "
+                             f"Valores: 1Min, 5Min, 15Min, 1Hour, 1Day.")
+    parser.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca",
+                        help="E: origen de datos en --mode live. 'alpaca' (real-time, requiere creds) "
+                             "o 'yahoo' (delay 15-20m, gratis).")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="E: --mode live no envía órdenes reales (simulación con logging).")
+    parser.add_argument("--live-position-size-pct", type=float, default=2.0,
+                        help="E: % del capital por trade en --mode live (default: 2.0).")
+    parser.add_argument("--live-max-iters", type=int, default=None,
+                        help="E: limite de iteraciones (None = infinito). Útil para test.")
+    parser.add_argument("--live-sleep", type=int, default=None,
+                        help="E: override de los segundos de sleep entre iteraciones.")
 
     args = parser.parse_args()
 
@@ -661,7 +766,24 @@ def main() -> None:
             use_cache=not args.features_no_cache,
         )
     elif args.mode == "live":
-        run_live()
+        run_live(
+            symbol=args.symbol,
+            timeframe=args.live_timeframe,
+            strategy_name=args.strategy,
+            model_path=args.model,
+            threshold_override=args.train_threshold,
+            dry_run=args.dry_run,
+            data_source=args.data_source,
+            risk_overlay=args.risk_overlay,
+            target_vol=args.target_vol,
+            max_daily_loss_pct=args.max_daily_loss_pct,
+            disable_confidence_sizing=args.no_confidence_sizing,
+            base_position_size_pct=args.live_position_size_pct,
+            stop_loss_pct=args.stop_loss_pct,
+            take_profit_pct=args.take_profit_pct,
+            max_iters=args.live_max_iters,
+            sleep_seconds=args.live_sleep,
+        )
 
 
 if __name__ == "__main__":
