@@ -16,17 +16,34 @@ Flujo:
        base_rate, uplift, y feature importance.
     8. Reentrenar sobre todo el histórico y persistir a disco.
 
-Selección de threshold (P5):
+Selección de threshold (D):
     El threshold de la probabilidad (τ) — aquel por encima del cual una
     señal del ensemble se toma como buena — se elige de dos formas según
     `threshold_objective`:
 
-      * "sharpe" (NUEVO, default): maximiza el Sharpe simulado de los
+      * "sharpe" (default): maximiza el Sharpe simulado de los
         trades realizados con los retornos realizados de cada trade
         hipotético (columna `ret` en meta_df). Más orientado a P&L.
       * "f1" (legacy): maximiza el F1 de clasificación. Orientado a
         precisión/recall del clasificador; puede no correlar con P&L
         (un F1 alto con entradas pequeñas no garantiza Sharpe alto).
+
+Método de CV (F):
+    `cv_method` selecciona cómo se generan los splits internos:
+
+      * "walk_forward" (default): expanding window con embargo. Simple
+        y respeta la flecha del tiempo, pero los folds tienen tamaño
+        desigual y la varianza CV es alta.
+      * "purged_kfold" (López de Prado): K folds disjuntos. Cada sample
+        sirve como test exactamente una vez. Train = todo lo demás
+        MENOS la zona de purge (samples cuyo horizonte de label se
+        solapa con el test) MENOS la zona de embargo (los siguientes
+        `embargo_bars` después del test). Métricas CV mucho más
+        estables y honestas, a costa de mezclar futuro/pasado en train.
+
+    Para deploy final se recomienda walk_forward (consistente con cómo
+    operará el bot en producción). purged_kfold es más útil para
+    auditar overfitting y comparar variantes de la pipeline.
 
 El modelo se guarda como dict con: model, feature_cols, threshold (elegido
 según `threshold_objective`), tb_config, metrics por fold.
@@ -39,7 +56,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import joblib
 import lightgbm as lgb
@@ -101,6 +118,25 @@ class MetaLabelerConfig:
     # calculados sobre 2-3 trades. Si ningún τ alcanza el mínimo, se cae al
     # τ que deje más trades (cola del rango de búsqueda).
     min_trades_threshold: int = 10
+
+    # ── Método de validación cruzada (F) ────────────────────────────────
+    # "walk_forward" (default, comportamiento histórico): expanding window.
+    #     Train = [0, train_end), test = [train_end+embargo, fold_end).
+    #     Bias optimista: el test siempre es "futuro" pero la última fold
+    #     se valida con muchos más datos que la primera (varianza alta).
+    # "purged_kfold" (López de Prado): K folds disjuntas, cada una hace de
+    #     test una vez. Train = todas las demás MENOS los samples cuyo
+    #     horizonte de label se solapa con el test (purge) y MENOS los
+    #     primeros `embargo_bars` después del test (embargo). Más honesto:
+    #     todos los folds tienen el mismo tamaño y se eliminan los samples
+    #     "infectados" por leakage temporal.
+    cv_method: str = "walk_forward"
+
+    # Horizonte de label usado por purged_kfold para el "purge". Por defecto
+    # = max_bars (el timeout del triple-barrier), porque cada label puede
+    # depender hasta `max_bars` barras hacia adelante. Si lo dejas en None,
+    # se inicializa en `max_bars`.
+    purge_bars: Optional[int] = None
 
 
 # ──────────────────────────────────────────────
@@ -288,6 +324,90 @@ class MetaLabelerTrainer:
         return X, y, meta
 
     # ──────────────────────────────────────────
+    def _cv_splits(self, n: int) -> Iterator[Tuple[np.ndarray, np.ndarray, int]]:
+        """
+        Generador de splits (train_idx, test_idx, fold_id).
+
+        Soporta dos métodos según `self.config.cv_method`:
+
+        ── walk_forward (default, expanding window con embargo) ────────────
+            Para cada fold i ∈ [1..k]:
+                train = [0, fold_size*i)
+                test  = [fold_size*i + embargo, fold_size*(i+1))
+            Mantiene la "flecha del tiempo": train siempre es pasado, test
+            siempre futuro. Sesgo: el último fold tiene mucho más train que
+            el primero, y la varianza de la métrica entre folds es alta.
+
+        ── purged_kfold (López de Prado, más honesto) ──────────────────────
+            Particiona [0,n) en K bloques contiguos disjuntos. Para cada uno:
+                test  = el bloque
+                train = todos los demás índices, EXCEPTO:
+                  · purge      : los samples cuyo horizonte de label
+                                 (max_bars hacia adelante) podría solaparse
+                                 con el test → leakage. Se eliminan los
+                                 últimos `purge_bars` antes del test.
+                  · embargo    : los `embargo_bars` justo después del test,
+                                 evita que la cola del trade durante el
+                                 test contamine al train que viene a
+                                 continuación.
+
+            Resultado: cada sample sirve como test exactamente una vez, y
+            los folds tienen el mismo tamaño. La varianza CV baja y la
+            métrica es más representativa.
+
+        Devuelve tuples (train_idx, test_idx, fold_id) con índices
+        posicionales (no etiquetas) ordenados sobre el dataset que ya
+        viene ordenado por timestamp global.
+        """
+        method = self.config.cv_method
+        k = self.config.n_splits
+        embargo = max(0, int(self.config.embargo_bars))
+        # `purge_bars` por defecto = `max_bars` del triple-barrier; es el
+        # horizonte máximo que mira cada label hacia adelante.
+        horizon = (
+            self.config.purge_bars
+            if self.config.purge_bars is not None
+            else self.config.max_bars
+        )
+        horizon = max(0, int(horizon))
+
+        if method == "walk_forward":
+            fold_size = n // (k + 1)
+            for i in range(1, k + 1):
+                train_end = fold_size * i
+                test_start = train_end + embargo
+                test_end = min(fold_size * (i + 1), n)
+                if test_start >= test_end:
+                    continue
+                train_idx = np.arange(0, train_end, dtype=int)
+                test_idx = np.arange(test_start, test_end, dtype=int)
+                yield train_idx, test_idx, i
+
+        elif method == "purged_kfold":
+            # Tamaño base por fold (los últimos absorben los restos).
+            fold_size = max(1, n // k)
+            for i in range(k):
+                test_lo = i * fold_size
+                test_hi = (i + 1) * fold_size if i < k - 1 else n
+                if test_hi <= test_lo:
+                    continue
+                test_idx = np.arange(test_lo, test_hi, dtype=int)
+                # Zona contaminada que se elimina del train:
+                #   - hasta `horizon` barras antes del test (overlap label).
+                #   - hasta `embargo` barras después del test.
+                purge_lo = max(0, test_lo - horizon - 1)
+                purge_hi = min(n, test_hi + embargo)
+                mask = np.ones(n, dtype=bool)
+                mask[purge_lo:purge_hi] = False
+                train_idx = np.where(mask)[0]
+                yield train_idx, test_idx, i + 1
+
+        else:
+            raise ValueError(
+                f"cv_method desconocido: {method!r}. Usa 'walk_forward' o 'purged_kfold'."
+            )
+
+    # ──────────────────────────────────────────
     def walk_forward_fit(
         self,
         X: pd.DataFrame,
@@ -295,7 +415,12 @@ class MetaLabelerTrainer:
         ret: Optional[pd.Series] = None,
     ) -> dict:
         """
-        Walk-forward expanding window con embargo.
+        Entrena con cross-validation según `self.config.cv_method`
+        ('walk_forward' o 'purged_kfold').
+
+        El nombre histórico de este método se mantiene por compatibilidad,
+        aunque ahora soporta ambos métodos. Internamente delega los splits
+        a `_cv_splits()`.
 
         Args:
             X    : features (n × k).
@@ -305,8 +430,8 @@ class MetaLabelerTrainer:
                    (threshold_objective="sharpe"). Si es None, se cae a F1.
 
         Devuelve: dict con el modelo final (re-entrenado sobre TODO el
-        histórico), feature_cols, threshold elegido, métricas por fold y
-        feature importance.
+        histórico), feature_cols, threshold elegido, métricas por fold,
+        cv_method utilizado y feature importance.
         """
         n = len(X)
         if n < self.config.min_samples:
@@ -315,31 +440,22 @@ class MetaLabelerTrainer:
                 f"Aumenta el histórico o relaja el régimen de la estrategia."
             )
 
-        fold_size = n // (self.config.n_splits + 1)
-        embargo = self.config.embargo_bars
         fold_metrics = []
         objective = self.config.threshold_objective
+        cv_method = self.config.cv_method
 
-        for i in range(1, self.config.n_splits + 1):
-            # Expanding window: train de [0, train_end), test de
-            # [test_start, test_end). El embargo es el "hueco" entre ambos
-            # para que ningún trade abierto al final del train aparezca en
-            # los primeros bares del test (purging simple).
-            train_end = fold_size * i
-            test_start = train_end + embargo
-            test_end = min(fold_size * (i + 1), n)
-            if test_start >= test_end:
-                continue
-
-            X_train = X.iloc[:train_end]
-            y_train = y.iloc[:train_end]
-            X_test = X.iloc[test_start:test_end]
-            y_test = y.iloc[test_start:test_end]
-            ret_test = ret.iloc[test_start:test_end] if ret is not None else None
+        for train_idx, test_idx, fold_id in self._cv_splits(n):
+            X_train = X.iloc[train_idx]
+            y_train = y.iloc[train_idx]
+            X_test = X.iloc[test_idx]
+            y_test = y.iloc[test_idx]
+            ret_test = ret.iloc[test_idx] if ret is not None else None
 
             # Requiere que haya al menos un representante de cada clase.
             if y_train.nunique() < 2 or len(X_train) < 20 or len(X_test) < 5:
                 continue
+
+            i = fold_id  # alias usado por las métricas más abajo
 
             model = lgb.LGBMClassifier(**self.config.lgb_params, random_state=self.config.random_state)
             model.fit(X_train, y_train)
@@ -407,6 +523,7 @@ class MetaLabelerTrainer:
             "feature_cols": X.columns.tolist(),
             "threshold": threshold,
             "threshold_objective": objective,
+            "cv_method": cv_method,
             "fold_metrics": fold_metrics,
             "feature_importance": importances,
         }
