@@ -83,16 +83,27 @@ def triple_barrier_labels(df: pd.DataFrame, config: TripleBarrierConfig | None =
     exit_price = np.full(n, np.nan)
     label = np.zeros(n, dtype=np.int8)
 
+    # Bucle principal: para cada barra `i` simulamos el trade hipotético
+    # "abierto en t o t+1 y cerrado cuando toque alguna de las 3 barreras".
+    # Es un bucle secuencial (no vectorizable trivialmente porque la salida
+    # de cada trade depende del camino de precios), pero es O(n * max_bars)
+    # que para max_bars ≈ 10 y n ≈ 1300 son ~13k iteraciones — trivial.
     for i in range(n):
-        # Decidimos la barra de entrada.
+        # Barra donde "entramos" al trade hipotético. Por defecto
+        # entry_on_next_open=True → mimetiza el engine real que ejecuta
+        # la orden al open de la siguiente barra (evita look-ahead).
         start = i + 1 if cfg.entry_on_next_open else i
         if start >= n:
             break
+        # Si el ATR aún no está calculado (lookback inicial) no etiquetamos.
+        # Sin ATR no podemos dimensionar las barreras de forma correcta.
         if np.isnan(atr_arr[i]) or atr_arr[i] <= 0:
             continue
 
         ep = open_[start] if cfg.entry_on_next_open else close[i]
         a = atr_arr[i]
+        # Barreras en unidades absolutas (USD) usando el ATR como "tick"
+        # de volatilidad. El mismo tp_mult adapta la barrera a la vol local.
         tp = ep + cfg.tp_mult * a
         sl = ep - cfg.sl_mult * a
 
@@ -100,12 +111,21 @@ def triple_barrier_labels(df: pd.DataFrame, config: TripleBarrierConfig | None =
         tp_price[i] = tp
         sl_price[i] = sl
 
+        # Barrera temporal: forzamos salida tras max_bars barras incluso si
+        # ni TP ni SL han sido tocados. Label=0 en ese caso (timeout).
         end = min(start + cfg.max_bars, n - 1)
         outcome_label = 0
         outcome_bar = end
         outcome_price = close[end]
         for j in range(start, end + 1):
-            # Salida SL prioritaria sobre TP dentro de la misma barra (conservador).
+            # Orden de chequeo dentro de UNA MISMA barra:
+            #   1º SL (prioridad) → si low toca el stop, asumimos que
+            #      cerró en SL. Esto es pesimista (el high puede haber
+            #      tocado antes el TP), pero sin datos intra-barra no
+            #      podemos saberlo. Es la convención de López de Prado.
+            #   2º TP → si high toca take-profit, cerramos en TP.
+            # Si ambos se "cumplen" en la misma barra, nos quedamos con
+            # el SL (la lectura pesimista hace el modelo más robusto).
             if low[j] <= sl:
                 outcome_label = -1
                 outcome_bar = j
@@ -120,6 +140,8 @@ def triple_barrier_labels(df: pd.DataFrame, config: TripleBarrierConfig | None =
         exit_price[i] = outcome_price
         label[i] = outcome_label
 
+    # Retorno realizado por cada trade hipotético. Usado en P5 (selección
+    # de threshold por Sharpe) y también por quien quiera reportar P&L.
     ret = (exit_price - entry_price) / entry_price
 
     return pd.DataFrame(

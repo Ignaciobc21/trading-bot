@@ -5,16 +5,31 @@ Flujo:
     1. Cargar datos OHLCV del símbolo.
     2. Construir features (features.FeatureBuilder).
     3. Generar señales con una estrategia base (por defecto EnsembleStrategy).
-    4. Construir meta-labels (labels.meta_labels).
+    4. Construir meta-labels (labels.meta_labels). Cada fila trae label
+       binario (win/loss) Y el retorno realizado del trade hipotético.
     5. Alinear features ↔ meta-labels.
     6. Walk-forward k-fold con "embargo" al cambio de fold para reducir
-       data leakage.
+       data leakage (los próximos N bares al borde train/test se descartan,
+       evita que el modelo vea información de trades aún "vivos" al crossear
+       del set de training al de test).
     7. LightGBM binary classifier. Reportar AUC, precision, recall, f1,
        base_rate, uplift, y feature importance.
     8. Reentrenar sobre todo el histórico y persistir a disco.
 
+Selección de threshold (P5):
+    El threshold de la probabilidad (τ) — aquel por encima del cual una
+    señal del ensemble se toma como buena — se elige de dos formas según
+    `threshold_objective`:
+
+      * "sharpe" (NUEVO, default): maximiza el Sharpe simulado de los
+        trades realizados con los retornos realizados de cada trade
+        hipotético (columna `ret` en meta_df). Más orientado a P&L.
+      * "f1" (legacy): maximiza el F1 de clasificación. Orientado a
+        precisión/recall del clasificador; puede no correlar con P&L
+        (un F1 alto con entradas pequeñas no garantiza Sharpe alto).
+
 El modelo se guarda como dict con: model, feature_cols, threshold (elegido
-por maximizar F1 en el último fold OOS), tb_config, metrics.
+según `threshold_objective`), tb_config, metrics por fold.
 
 El inferencer (`load_meta_labeler`) devuelve un objeto con métodos
 `predict_proba(features_row)` y `should_take(features_row)`.
@@ -72,6 +87,20 @@ class MetaLabelerConfig:
     sl_mult: float = 1.0
     max_bars: int = 10
     atr_period: int = 14
+    # ── Selección del threshold de probabilidad ──
+    # "sharpe" (default): escoge τ que maximiza el Sharpe de los trades
+    #     ganadores según la columna `ret` (retorno realizado).
+    # "f1"            : comportamiento legacy. Maximiza F1 clasificatorio.
+    threshold_objective: str = "sharpe"
+    # Rango de candidatos τ explorado en la búsqueda lineal.
+    threshold_min: float = 0.30
+    threshold_max: float = 0.80
+    threshold_n: int = 26
+    # Número mínimo de trades que debe quedar por encima de τ en el set de
+    # test de un fold para considerar ese τ válido. Evita Sharpe espurios
+    # calculados sobre 2-3 trades. Si ningún τ alcanza el mínimo, se cae al
+    # τ que deje más trades (cola del rango de búsqueda).
+    min_trades_threshold: int = 10
 
 
 # ──────────────────────────────────────────────
@@ -87,6 +116,92 @@ class MetaLabelerTrainer:
         self.config = config or MetaLabelerConfig()
         self.strategy = strategy or build_default_ensemble()
         self.feature_builder = feature_builder or FeatureBuilder()
+
+    # ──────────────────────────────────────────
+    # Selección de threshold (ver docstring del módulo)
+    # ──────────────────────────────────────────
+    def _candidate_thresholds(self) -> np.ndarray:
+        """Rango lineal de τ candidatos. Parametrizado en el config."""
+        return np.linspace(
+            self.config.threshold_min,
+            self.config.threshold_max,
+            self.config.threshold_n,
+        )
+
+    @staticmethod
+    def _sharpe_of_trades(rets: np.ndarray) -> float:
+        """
+        Sharpe-like ratio sobre retornos de trades discretos.
+
+        Fórmula usada:
+            S = mean(r) / std(r) * sqrt(N)
+
+        El factor sqrt(N) premia los thresholds con más trades válidos
+        (más "confianza estadística"), y penaliza los que dejan muy pocas
+        entradas aunque el mean/std sea bueno — esto es justo lo contrario
+        de lo que F1 hace, y aquí es lo que queremos: un edge consistente
+        en muchos trades es preferible a uno espectacular en 3.
+        """
+        if len(rets) == 0:
+            return float("-inf")
+        std = float(np.std(rets, ddof=1)) if len(rets) > 1 else 0.0
+        if std <= 1e-12:
+            # Sin varianza → ignoramos (posible look-ahead/degenerate).
+            return float("-inf")
+        return float(np.mean(rets) / std * np.sqrt(len(rets)))
+
+    def _select_threshold(
+        self,
+        y_test: pd.Series,
+        proba: np.ndarray,
+        ret_test: Optional[pd.Series],
+        objective: str,
+    ) -> Tuple[float, float]:
+        """
+        Devuelve (best_threshold, best_score) según el criterio elegido.
+
+        objective="f1": busca τ que maximiza F1 (precisión/recall de la
+            clase 1). Score = F1.
+        objective="sharpe": busca τ que maximiza el Sharpe sobre `ret_test`
+            restringido al subconjunto `proba >= τ`. Score = Sharpe·sqrt(n).
+            Si `ret_test` es None, se cae a F1 como salvaguarda.
+        """
+        cands = self._candidate_thresholds()
+
+        # Fallback de seguridad: si no nos han pasado retornos realizados,
+        # no podemos calcular Sharpe. Usamos F1.
+        if objective == "sharpe" and ret_test is None:
+            objective = "f1"
+
+        if objective == "sharpe":
+            ret_arr = ret_test.to_numpy().astype(float)
+            best_score = float("-inf")
+            best_thr = float(self.config.threshold_min)
+            best_n = 0
+            for thr in cands:
+                mask = proba >= thr
+                n = int(mask.sum())
+                if n < self.config.min_trades_threshold:
+                    continue
+                score = self._sharpe_of_trades(ret_arr[mask])
+                if score > best_score:
+                    best_score, best_thr, best_n = score, float(thr), n
+            # Si ningún τ tenía suficientes trades, caemos al más permisivo.
+            if best_n == 0:
+                best_thr = float(self.config.threshold_min)
+                best_score = float("nan")
+            return best_thr, best_score
+
+        # objective == "f1"
+        best_f1, best_thr = -1.0, 0.5
+        for thr in cands:
+            pred = (proba >= thr).astype(int)
+            _, _, f1, _ = precision_recall_fscore_support(
+                y_test, pred, average="binary", zero_division=0
+            )
+            if f1 > best_f1:
+                best_f1, best_thr = float(f1), float(thr)
+        return best_thr, best_f1
 
     # ──────────────────────────────────────────
     def build_dataset(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
@@ -173,9 +288,26 @@ class MetaLabelerTrainer:
         return X, y, meta
 
     # ──────────────────────────────────────────
-    def walk_forward_fit(self, X: pd.DataFrame, y: pd.Series) -> dict:
-        """Walk-forward expanding window con embargo. Devuelve métricas OOS
-        por fold y el modelo final re-entrenado sobre todo el conjunto."""
+    def walk_forward_fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        ret: Optional[pd.Series] = None,
+    ) -> dict:
+        """
+        Walk-forward expanding window con embargo.
+
+        Args:
+            X    : features (n × k).
+            y    : labels binarios (win=1 / loss=0), alineados con X.
+            ret  : retornos realizados por trade (alineados con X). Si se
+                   facilita, habilita la selección de threshold por Sharpe
+                   (threshold_objective="sharpe"). Si es None, se cae a F1.
+
+        Devuelve: dict con el modelo final (re-entrenado sobre TODO el
+        histórico), feature_cols, threshold elegido, métricas por fold y
+        feature importance.
+        """
         n = len(X)
         if n < self.config.min_samples:
             raise ValueError(
@@ -186,8 +318,13 @@ class MetaLabelerTrainer:
         fold_size = n // (self.config.n_splits + 1)
         embargo = self.config.embargo_bars
         fold_metrics = []
+        objective = self.config.threshold_objective
 
         for i in range(1, self.config.n_splits + 1):
+            # Expanding window: train de [0, train_end), test de
+            # [test_start, test_end). El embargo es el "hueco" entre ambos
+            # para que ningún trade abierto al final del train aparezca en
+            # los primeros bares del test (purging simple).
             train_end = fold_size * i
             test_start = train_end + embargo
             test_end = min(fold_size * (i + 1), n)
@@ -198,6 +335,7 @@ class MetaLabelerTrainer:
             y_train = y.iloc[:train_end]
             X_test = X.iloc[test_start:test_end]
             y_test = y.iloc[test_start:test_end]
+            ret_test = ret.iloc[test_start:test_end] if ret is not None else None
 
             # Requiere que haya al menos un representante de cada clase.
             if y_train.nunique() < 2 or len(X_train) < 20 or len(X_test) < 5:
@@ -212,21 +350,29 @@ class MetaLabelerTrainer:
             except ValueError:
                 auc = float("nan")
 
-            # Elegimos threshold que maximiza F1 en el set de test del fold.
-            best_f1, best_thr = -1.0, 0.5
-            for thr in np.linspace(0.3, 0.8, 26):
-                pred = (proba >= thr).astype(int)
-                prec, rec, f1, _ = precision_recall_fscore_support(
-                    y_test, pred, average="binary", zero_division=0
-                )
-                if f1 > best_f1:
-                    best_f1, best_thr = float(f1), float(thr)
+            # Selección del threshold — sharpe (nuevo default) o f1 (legacy).
+            best_thr, best_score = self._select_threshold(
+                y_test=y_test, proba=proba, ret_test=ret_test, objective=objective,
+            )
 
+            # Métricas descriptivas SIEMPRE se reportan con el threshold
+            # elegido, sea cual sea el criterio. Así podemos comparar F1 y
+            # Sharpe del mismo fold.
             pred = (proba >= best_thr).astype(int)
             prec, rec, f1, _ = precision_recall_fscore_support(
                 y_test, pred, average="binary", zero_division=0
             )
             acc = float(accuracy_score(y_test, pred))
+
+            # Retorno medio de los trades aceptados por el modelo en este fold.
+            if ret_test is not None:
+                kept = ret_test[pred == 1]
+                mean_ret = float(kept.mean()) if len(kept) else float("nan")
+                trades_kept = int(len(kept))
+            else:
+                mean_ret = float("nan")
+                trades_kept = int((pred == 1).sum())
+
             fold_metrics.append({
                 "fold": i,
                 "n_train": int(len(X_train)),
@@ -234,14 +380,18 @@ class MetaLabelerTrainer:
                 "base_rate": base_rate,
                 "auc": auc,
                 "threshold": best_thr,
+                "objective_score": float(best_score),
                 "precision": float(prec),
                 "recall": float(rec),
                 "f1": float(f1),
                 "accuracy": acc,
                 "uplift_vs_base": float(prec - base_rate) if base_rate > 0 else float("nan"),
+                "trades_kept": trades_kept,
+                "mean_ret_kept": mean_ret,
             })
 
-        # Modelo final sobre todo el histórico.
+        # Modelo final sobre todo el histórico. Usamos la MEDIANA de los
+        # thresholds elegidos por fold — robusta a outliers en folds pequeños.
         final_model = lgb.LGBMClassifier(**self.config.lgb_params, random_state=self.config.random_state)
         final_model.fit(X, y)
         threshold = float(np.median([m["threshold"] for m in fold_metrics])) if fold_metrics else 0.5
@@ -256,14 +406,23 @@ class MetaLabelerTrainer:
             "model": final_model,
             "feature_cols": X.columns.tolist(),
             "threshold": threshold,
+            "threshold_objective": objective,
             "fold_metrics": fold_metrics,
             "feature_importance": importances,
         }
 
     # ──────────────────────────────────────────
+    @staticmethod
+    def _extract_ret(meta_df: pd.DataFrame, index: pd.Index) -> Optional[pd.Series]:
+        """Serie `ret` alineada con `index`, o None si la columna no existe."""
+        if "ret" not in meta_df.columns:
+            return None
+        return meta_df.loc[index, "ret"].astype(float)
+
     def train(self, df: pd.DataFrame) -> dict:
         X, y, meta_df = self.build_dataset(df)
-        result = self.walk_forward_fit(X, y)
+        ret = self._extract_ret(meta_df, X.index)
+        result = self.walk_forward_fit(X, y, ret=ret)
         result["config"] = asdict(self.config)
         result["n_samples"] = int(len(X))
         result["base_rate_global"] = float(y.mean()) if len(y) else float("nan")
@@ -273,7 +432,8 @@ class MetaLabelerTrainer:
     def train_multi(self, dfs: Dict[str, pd.DataFrame]) -> dict:
         """Entrena sobre un basket de símbolos. `dfs` = {symbol: ohlcv_df}."""
         X, y, meta_df = self.build_dataset_multi(dfs)
-        result = self.walk_forward_fit(X, y)
+        ret = self._extract_ret(meta_df, X.index)
+        result = self.walk_forward_fit(X, y, ret=ret)
         result["config"] = asdict(self.config)
         result["n_samples"] = int(len(X))
         result["base_rate_global"] = float(y.mean()) if len(y) else float("nan")
@@ -321,12 +481,17 @@ class MetaLabelerTrainer:
                 continue
             X_r = X.iloc[mask]
             y_r = y.iloc[mask]
+            # `ret` per-régimen: sólo los retornos realizados de las señales
+            # que vienen de ese sub-estrategia (trend vs MR). Importante que
+            # los sub-thresholds se elijan con los retornos reales de su
+            # propio tipo de señal.
+            ret_r = self._extract_ret(meta_df, X_r.index)
             print(
                 f"[regime-split] {regime_name}: {len(X_r)} muestras  "
                 f"base_rate={y_r.mean():.3f}"
             )
             try:
-                res = self.walk_forward_fit(X_r, y_r)
+                res = self.walk_forward_fit(X_r, y_r, ret=ret_r)
             except ValueError as exc:
                 print(f"[regime-split] {regime_name}: skip fit ({exc})")
                 continue
