@@ -15,7 +15,7 @@ aprender con datos limitados y mucho más robusto out-of-sample.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
 
@@ -27,6 +27,7 @@ def build_meta_labels(
     df: pd.DataFrame,
     signals: pd.Series,
     tb_config: TripleBarrierConfig | None = None,
+    sources: Optional[pd.Series] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Construye el dataset de meta-etiquetas a partir de un DataFrame OHLCV y
@@ -58,4 +59,9 @@ def build_meta_labels(
         idx_array = df.index
         exit_ts = idx_array[meta["exit_bar"].clip(0, len(idx_array) - 1)]
         meta["exit_ts"] = exit_ts
-    return tb, meta[["meta", "ret", "entry_price", "exit_price", "exit_bar", "exit_ts"]]
+
+    cols = ["meta", "ret", "entry_price", "exit_price", "exit_bar", "exit_ts"]
+    if sources is not None:
+        meta["source"] = sources.loc[meta.index].astype(str)
+        cols.append("source")
+    return tb, meta[cols]

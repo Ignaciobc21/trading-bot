@@ -241,22 +241,33 @@ def run_train(
     sl_mult: float = 1.0,
     max_bars: int = 10,
     symbols: Optional[list] = None,
+    regime_split: bool = False,
 ) -> None:
     """Entrena un MetaLabeler LightGBM sobre señales del ensemble y persiste.
 
-    Si `symbols` es una lista → basket training (P4.1). Si no, single-symbol.
+    Modos:
+      - single-symbol (P4)        → `symbol` + no split
+      - basket (P4.1)             → `symbols` + no split
+      - basket + regime-split (P4.2) → `symbols` + regime_split=True:
+          entrena DOS modelos (trend-follow / mean-revert) en un único payload.
     """
     from data.fetcher import DataFetcher
     from ml.meta_labeler import MetaLabelerTrainer, MetaLabelerConfig, save_meta_labeler
 
     logger.info("═" * 50)
+    tag = []
     if symbols:
-        logger.info("  MODO TRAIN (BASKET) — %d simbolos  %s %s  TP=%.2f SL=%.2f Max=%d",
-                    len(symbols), interval, period, tp_mult, sl_mult, max_bars)
-    else:
-        logger.info("  MODO TRAIN — %s %s %s  TP=%.2f SL=%.2f Max=%d",
-                    symbol, interval, period, tp_mult, sl_mult, max_bars)
+        tag.append("BASKET x%d" % len(symbols))
+    if regime_split:
+        tag.append("REGIME-SPLIT")
+    label = " ".join(tag) if tag else "SINGLE"
+    logger.info("  MODO TRAIN [%s] — %s %s %s  TP=%.2f SL=%.2f Max=%d",
+                label, symbol or "basket", interval, period, tp_mult, sl_mult, max_bars)
     logger.info("═" * 50)
+
+    if regime_split and not symbols:
+        logger.error("--regime-split requiere --symbols (entrenamiento sobre basket).")
+        sys.exit(1)
 
     cfg = MetaLabelerConfig(tp_mult=tp_mult, sl_mult=sl_mult, max_bars=max_bars)
     trainer = MetaLabelerTrainer(config=cfg)
@@ -274,7 +285,7 @@ def run_train(
         if not dfs:
             logger.error("Ningún símbolo del basket produjo datos.")
             sys.exit(1)
-        result = trainer.train_multi(dfs)
+        result = trainer.train_multi_regime_split(dfs) if regime_split else trainer.train_multi(dfs)
     else:
         df = DataFetcher.fetch_yahoo(ticker=symbol, period=period, interval=interval)
         if df.empty:
@@ -283,23 +294,42 @@ def run_train(
         logger.info("Datos: %d filas [%s → %s]", len(df), df.index[0], df.index[-1])
         result = trainer.train(df)
 
-    logger.info("Muestras: %d  |  base_rate global: %.3f",
-                result["n_samples"], result["base_rate_global"])
-    logger.info("Threshold elegido: %.3f", result["threshold"])
-    if result.get("samples_per_symbol"):
-        logger.info("Muestras por simbolo: %s", result["samples_per_symbol"])
-
-    print("\n-- Metricas por fold (walk-forward) --")
-    if result["fold_metrics"]:
-        folds_df = pd.DataFrame(result["fold_metrics"])
-        print(folds_df.round(4).to_string(index=False))
+    if result.get("kind") == "regime_split":
+        # Reporting específico para el payload per-régimen.
+        logger.info("Muestras por regimen: %s", result.get("samples_per_regime", {}))
+        if result.get("samples_per_symbol"):
+            logger.info("Muestras por simbolo: %s", result["samples_per_symbol"])
+        for name, sub in result["regimes"].items():
+            logger.info(
+                "Regimen %-11s : %d muestras  base_rate=%.3f  thr=%.3f",
+                name, sub["n_samples"], sub["base_rate_global"], sub["threshold"],
+            )
+            print(f"\n-- [{name}] Metricas por fold (walk-forward) --")
+            if sub["fold_metrics"]:
+                print(pd.DataFrame(sub["fold_metrics"]).round(4).to_string(index=False))
+            else:
+                print("(sin folds — muestras insuficientes)")
+            print(f"\n-- [{name}] Top 10 features por importancia --")
+            for k, v in list(sub["feature_importance"].items())[:10]:
+                print(f"  {k:<25}  {v}")
     else:
-        print("(sin folds — muestras insuficientes para splits internos)")
+        logger.info("Muestras: %d  |  base_rate global: %.3f",
+                    result["n_samples"], result["base_rate_global"])
+        logger.info("Threshold elegido: %.3f", result["threshold"])
+        if result.get("samples_per_symbol"):
+            logger.info("Muestras por simbolo: %s", result["samples_per_symbol"])
 
-    print("\n-- Top 15 features por importancia --")
-    top = list(result["feature_importance"].items())[:15]
-    for k, v in top:
-        print(f"  {k:<25}  {v}")
+        print("\n-- Metricas por fold (walk-forward) --")
+        if result["fold_metrics"]:
+            folds_df = pd.DataFrame(result["fold_metrics"])
+            print(folds_df.round(4).to_string(index=False))
+        else:
+            print("(sin folds — muestras insuficientes para splits internos)")
+
+        print("\n-- Top 15 features por importancia --")
+        top = list(result["feature_importance"].items())[:15]
+        for k, v in top:
+            print(f"  {k:<25}  {v}")
 
     path = save_meta_labeler(result, out_path)
     logger.info("Modelo guardado en %s (%d bytes)", path, path.stat().st_size)
@@ -490,6 +520,9 @@ def main() -> None:
                         help="Barras máximas antes del timeout en triple-barrier (default: 10)")
     parser.add_argument("--train-threshold", type=float, default=None,
                         help="Override del threshold de probabilidad para meta_ensemble (default: threshold entrenado)")
+    parser.add_argument("--regime-split", action="store_true",
+                        help="P4.2: entrena dos modelos separados (trend-follow y mean-revert) "
+                             "en un único .pkl. Requiere --symbols.")
 
     args = parser.parse_args()
 
@@ -538,6 +571,7 @@ def main() -> None:
             sl_mult=args.train_sl_mult,
             max_bars=args.train_max_bars,
             symbols=symbols_list,
+            regime_split=args.regime_split,
         )
     elif args.mode == "features":
         period = args.period

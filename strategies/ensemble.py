@@ -16,12 +16,19 @@ funcione directamente con el BacktestEngine vectorizado.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import pandas as pd
 
 from strategies.base import BaseStrategy, StrategySignal, Action
 from strategies.regime import Regime, RegimeDetector
+
+
+# Etiquetas estándar del "origen" de una señal BUY dentro del ensemble.
+# Se exponen como módulo-level constants para que otros módulos (trainer,
+# inferencer) puedan referenciarlas sin hard-codear strings.
+SOURCE_TREND = "trend"
+SOURCE_MR = "mean_revert"
 
 
 class EnsembleStrategy(BaseStrategy):
@@ -54,6 +61,19 @@ class EnsembleStrategy(BaseStrategy):
     # Señales vectorizadas
     # ──────────────────────────────────────────
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
+        actions, _ = self.generate_signals_with_source(df)
+        return actions
+
+    def generate_signals_with_source(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+        """
+        Versión extendida de `generate_signals` que además devuelve una
+        Serie `sources` del mismo tamaño, con el origen de cada BUY:
+            - SOURCE_TREND ("trend")        si la produjo la sub-estrategia trend-follower.
+            - SOURCE_MR    ("mean_revert")  si la produjo la sub-estrategia MR.
+            - ""                           en el resto (HOLD / SELL).
+
+        Se usa para entrenar modelos ML separados por sub-estrategia (P4.2).
+        """
         regime = self.detector.classify(df)
         self._last_regime = regime
 
@@ -93,11 +113,16 @@ class EnsembleStrategy(BaseStrategy):
         if not self.allow_trend_down:
             actions[in_trend_down] = Action.SELL
 
-        # BUY tiene prioridad en caso de empate.
-        actions[trend_buy] = Action.BUY
+        # BUY tiene prioridad en caso de empate. Dentro de los BUYs, si ambas
+        # sub-estrategias coinciden en la misma barra, prevalece el trend
+        # (más conservador: entra sólo cuando hay tendencia clara).
+        sources = pd.Series("", index=df.index, dtype=object, name="source")
         actions[mr_buy] = Action.BUY
+        sources[mr_buy] = SOURCE_MR
+        actions[trend_buy] = Action.BUY
+        sources[trend_buy] = SOURCE_TREND
 
-        return actions
+        return actions, sources
 
     # ──────────────────────────────────────────
     # Señal puntual (modo live)
