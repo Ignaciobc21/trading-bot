@@ -240,7 +240,9 @@ class MetaLabelerTrainer:
         return best_thr, best_f1
 
     # ──────────────────────────────────────────
-    def build_dataset(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+    def build_dataset(
+        self, df: pd.DataFrame, symbol: Optional[str] = None
+    ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
         """
         Devuelve (X, y, meta_df). X e y están alineados por timestamp de
         entrada de cada señal BUY de la estrategia base.
@@ -248,13 +250,20 @@ class MetaLabelerTrainer:
         Si la estrategia implementa `generate_signals_with_source(df)` (p.ej.
         el `EnsembleStrategy`), `meta_df` incluye además una columna `source`
         con el origen de cada BUY, útil para modelos per-régimen (P4.2).
+
+        `symbol` se usa sólo si el FeatureBuilder tiene `include_sentiment=True`
+        — pasa el ticker para que se construyan las features de sentimiento.
         """
+        # Anotar el símbolo en el DataFrame para que las downstream calls
+        # (sentiment) lo encuentren sin tener que cambiar firmas.
+        if symbol is not None:
+            df.attrs["symbol"] = symbol
         if hasattr(self.strategy, "generate_signals_with_source"):
             signals, sources = self.strategy.generate_signals_with_source(df)
         else:
             signals = self.strategy.generate_signals(df)
             sources = None
-        features = self.feature_builder.build(df)
+        features = self.feature_builder.build(df, symbol=symbol)
         tb_cfg = TripleBarrierConfig(
             tp_mult=self.config.tp_mult,
             sl_mult=self.config.sl_mult,
@@ -264,7 +273,15 @@ class MetaLabelerTrainer:
         _, meta_df = build_meta_labels(df, signals, tb_config=tb_cfg, sources=sources)
         # Alineación estricta: para cada señal BUY tomamos el vector de
         # features de esa barra (ya disponible en el cierre).
-        X = features.loc[meta_df.index].dropna()
+        X = features.loc[meta_df.index]
+        # Si están presentes, las features de sentimiento son
+        # legítimamente NaN para barras sin cobertura (p.ej. yfinance
+        # sólo expone noticias recientes). LightGBM las maneja
+        # nativamente, así que NO las exigimos para descartar la fila.
+        # Sí exigimos que estén las features "core" (técnicas).
+        sentiment_cols = [c for c in X.columns if c.startswith("news_") or c.startswith("fng_")]
+        core_cols = [c for c in X.columns if c not in sentiment_cols]
+        X = X.dropna(subset=core_cols)
         y = meta_df.loc[X.index, "meta"].astype(int)
         meta_df = meta_df.loc[X.index]
         return X, y, meta_df
@@ -294,7 +311,7 @@ class MetaLabelerTrainer:
             if df is None or df.empty:
                 continue
             try:
-                X_s, y_s, meta_s = self.build_dataset(df)
+                X_s, y_s, meta_s = self.build_dataset(df, symbol=sym)
             except Exception as exc:  # noqa: BLE001
                 # La estrategia puede no generar señales en algún ticker.
                 print(f"[basket] {sym}: skip ({exc})")
@@ -536,8 +553,8 @@ class MetaLabelerTrainer:
             return None
         return meta_df.loc[index, "ret"].astype(float)
 
-    def train(self, df: pd.DataFrame) -> dict:
-        X, y, meta_df = self.build_dataset(df)
+    def train(self, df: pd.DataFrame, symbol: Optional[str] = None) -> dict:
+        X, y, meta_df = self.build_dataset(df, symbol=symbol)
         ret = self._extract_ret(meta_df, X.index)
         result = self.walk_forward_fit(X, y, ret=ret)
         result["config"] = asdict(self.config)
