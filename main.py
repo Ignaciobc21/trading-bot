@@ -285,6 +285,7 @@ def run_train(
     max_bars: int = 10,
     symbols: Optional[list] = None,
     regime_split: bool = False,
+    threshold_objective: str = "sharpe",
 ) -> None:
     """Entrena un MetaLabeler LightGBM sobre señales del ensemble y persiste.
 
@@ -304,15 +305,21 @@ def run_train(
     if regime_split:
         tag.append("REGIME-SPLIT")
     label = " ".join(tag) if tag else "SINGLE"
-    logger.info("  MODO TRAIN [%s] — %s %s %s  TP=%.2f SL=%.2f Max=%d",
-                label, symbol or "basket", interval, period, tp_mult, sl_mult, max_bars)
+    logger.info("  MODO TRAIN [%s] — %s %s %s  TP=%.2f SL=%.2f Max=%d  thr-obj=%s",
+                label, symbol or "basket", interval, period, tp_mult, sl_mult, max_bars,
+                threshold_objective)
     logger.info("═" * 50)
 
     if regime_split and not symbols:
         logger.error("--regime-split requiere --symbols (entrenamiento sobre basket).")
         sys.exit(1)
 
-    cfg = MetaLabelerConfig(tp_mult=tp_mult, sl_mult=sl_mult, max_bars=max_bars)
+    cfg = MetaLabelerConfig(
+        tp_mult=tp_mult,
+        sl_mult=sl_mult,
+        max_bars=max_bars,
+        threshold_objective=threshold_objective,
+    )
     trainer = MetaLabelerTrainer(config=cfg)
 
     if symbols:
@@ -566,6 +573,10 @@ def main() -> None:
     parser.add_argument("--regime-split", action="store_true",
                         help="P4.2: entrena dos modelos separados (trend-follow y mean-revert) "
                              "en un único .pkl. Requiere --symbols.")
+    parser.add_argument("--threshold-objective", choices=["sharpe", "f1"], default="sharpe",
+                        help="D: criterio de elección del threshold del meta-modelo. "
+                             "'sharpe' (default) maximiza Sharpe de los retornos realizados; "
+                             "'f1' replica el comportamiento previo (max F1 de clasificación).")
     # ── P6: Risk overlay ──
     parser.add_argument("--risk-overlay", action="store_true",
                         help="P6: activa el risk overlay (vol targeting + regime + confidence sizing).")
@@ -634,6 +645,7 @@ def main() -> None:
             max_bars=args.train_max_bars,
             symbols=symbols_list,
             regime_split=args.regime_split,
+            threshold_objective=args.threshold_objective,
         )
     elif args.mode == "features":
         period = args.period

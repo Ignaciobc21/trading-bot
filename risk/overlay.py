@@ -82,12 +82,22 @@ class RiskOverlay:
 
     # ──────────────────────────────────────────
     def _annualize(self, index: pd.Index) -> float:
+        """
+        Devuelve el factor multiplicativo para pasar de desviación típica
+        por-barra a anualizada. Ejemplos:
+          - Diario: sqrt(252) ≈ 15.87
+          - Horario intradía (6.5h sesión): sqrt(6.5 * 252) ≈ 40.4
+
+        Si el usuario fija `annualize_factor` en el config, lo respetamos.
+        En caso contrario, inferimos la frecuencia por la mediana del
+        espaciamiento entre bares. Usa 252 días de trading/año como base.
+        """
         if self.config.annualize_factor is not None:
             return float(self.config.annualize_factor)
-        # Fallback: asume diario (252). El usuario puede forzar otro.
         if isinstance(index, pd.DatetimeIndex) and len(index) > 1:
             deltas = index.to_series().diff().dropna().dt.total_seconds()
             med = float(deltas.median()) if len(deltas) else 86400.0
+            # Si el paso mediano es < 23h lo tratamos como intradía.
             if med < 23 * 3600:
                 bars_per_day = (6.5 * 3600) / med
                 return float(np.sqrt(bars_per_day * 252.0))
@@ -96,8 +106,22 @@ class RiskOverlay:
     # ──────────────────────────────────────────
     def vol_multiplier(self, df: pd.DataFrame) -> pd.Series:
         """
-        Realized vol rolling (log returns), anualizada, y multiplicador
-        target_vol / realized_vol con cap + floor.
+        Componente de **vol targeting**. Para cada barra calcula:
+
+            mult_i = target_vol / realized_vol_annualized_i
+
+        * `realized_vol_annualized` = std rolling de log-returns × sqrt(factor).
+        * Si la volatilidad realizada es menor que `vol_floor`, la clippeamos
+          para no generar multiplicadores absurdos (p.ej. 500x) en periodos
+          muy planos — ese régimen casi nunca dura, y no queremos over-leverage.
+        * Si supera `vol_cap` la consideramos "blow-up" y devolvemos mult=0
+          (preferimos perder la entrada a operar en condiciones extremas).
+        * Limitamos el output final a [vol_mult_floor, vol_mult_cap]. Cap>1
+          permite leverage intencional en activos de vol baja.
+
+        Nota: hay una pequeña dependencia de look-ahead (rolling().std usa
+        n barras incluyendo la actual). Para uso live, el motor ya aplica
+        la señal del bar t-1 al open del bar t, así que no hay problema.
         """
         cfg = self.config
         close = df["close"].astype(float)
@@ -115,18 +139,38 @@ class RiskOverlay:
     # ──────────────────────────────────────────
     def regime_multiplier(self, regime_series: pd.Series) -> pd.Series:
         """
-        Aplica la tabla `regime_multipliers` fila a fila.
-        `regime_series` debe ser una pd.Series de enums Regime.
+        Componente de **regime sizing**. Lookup directo en la tabla
+        `regime_multipliers`:
+
+            TREND_UP    → 1.00  (full sizing con viento a favor)
+            MEAN_REVERT → 0.85  (trade táctico, ligeramente reducido)
+            CHOP        → 0.60  (mercado ruidoso, exposición moderada)
+            TREND_DOWN  → 0.00  (no abrir longs en tendencia bajista)
+
+        `regime_series` se espera como una Serie de enums `Regime` o sus
+        strings equivalentes (enum → str hash en el dict funciona igual).
+        Valores no mapeados → 0 (conservador).
         """
         cfg = self.config
-        # `map` sobre el enum directamente.
         return regime_series.map(cfg.regime_multipliers).fillna(0.0).rename("regime_mult")
 
     # ──────────────────────────────────────────
     def confidence_multiplier(self, proba: pd.Series) -> pd.Series:
         """
-        Linear scale: prob ≤ floor → confidence_min_mult, prob ≥ ceiling → 1.0,
-        interpolación lineal en medio. Si use_confidence_sizing=False, devuelve 1.
+        Componente de **confidence sizing**. Mapea la probabilidad del
+        meta-modelo a un multiplicador lineal:
+
+            proba ≤ confidence_floor   → confidence_min_mult
+            proba ≥ confidence_ceiling → 1.0
+            proba en medio             → interpolación lineal.
+
+        Defaults: floor=0.30, ceiling=0.70, min_mult=0.40. Es decir: los
+        BUYs con confianza baja (~0.30) se ejecutan al 40% del tamaño
+        base y los de confianza alta (~0.70) al 100%. En la práctica,
+        el meta-modelo suele producir probas entre 0.30 y 0.65.
+
+        Si `use_confidence_sizing=False`, devuelve una Serie de 1.0
+        (desactiva la componente sin tocar las otras dos).
         """
         cfg = self.config
         if not cfg.use_confidence_sizing:
@@ -134,6 +178,7 @@ class RiskOverlay:
         span = max(cfg.confidence_ceiling - cfg.confidence_floor, 1e-6)
         x = (proba - cfg.confidence_floor) / span
         x = x.clip(lower=0.0, upper=1.0)
+        # Lineal entre confidence_min_mult (en x=0) y 1.0 (en x=1).
         m = cfg.confidence_min_mult + (1.0 - cfg.confidence_min_mult) * x
         return m.rename("conf_mult")
 
@@ -145,9 +190,20 @@ class RiskOverlay:
         proba: Optional[pd.Series] = None,
     ) -> pd.Series:
         """
-        Devuelve un multiplicador de sizing en [overall_floor, overall_cap]
-        por barra. Sólo se aplica a entradas BUY — el motor lo lee en la
-        entrada y lo multiplica por `position_size_pct`.
+        Producto de los tres componentes anteriores, clippeado a
+        [overall_floor, overall_cap].
+
+        El motor sólo lee esta serie en el bar anterior a una entrada BUY.
+        En bares de HOLD/SELL el valor es irrelevante — lo mantenemos
+        fillna(overall_floor) por simplicidad; si el motor por error lee
+        un bar HOLD, el multiplicador será 0 y no se abrirá nada.
+
+        Args:
+            df     : OHLCV (necesario para vol_multiplier).
+            regime : Serie con el régimen por barra. Si None, se omite
+                     el componente de regime sizing.
+            proba  : Serie con la proba del meta-modelo (NaN en bares
+                     sin BUY). Si None, se omite confidence sizing.
         """
         cfg = self.config
         idx = df.index
@@ -155,6 +211,8 @@ class RiskOverlay:
         if regime is not None:
             mult = mult * self.regime_multiplier(regime).reindex(idx).fillna(0.0)
         if proba is not None:
+            # Bares sin proba (NaN) → usamos confidence_min_mult para no
+            # multiplicar por 0 y "matar" señales válidas fuera del meta-labeler.
             conf = self.confidence_multiplier(proba).reindex(idx).fillna(cfg.confidence_min_mult)
             mult = mult * conf
         mult = mult.clip(lower=cfg.overall_floor, upper=cfg.overall_cap)
