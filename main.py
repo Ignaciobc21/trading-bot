@@ -233,36 +233,61 @@ def run_features(
 #  MODO TRAIN (entrena meta-labeler LightGBM)
 # ═══════════════════════════════════════════════
 def run_train(
-    symbol: str,
+    symbol: Optional[str],
     period: str,
     interval: str,
     out_path: str,
     tp_mult: float = 2.0,
     sl_mult: float = 1.0,
     max_bars: int = 10,
+    symbols: Optional[list] = None,
 ) -> None:
-    """Entrena un MetaLabeler LightGBM sobre señales del ensemble y persiste."""
+    """Entrena un MetaLabeler LightGBM sobre señales del ensemble y persiste.
+
+    Si `symbols` es una lista → basket training (P4.1). Si no, single-symbol.
+    """
     from data.fetcher import DataFetcher
     from ml.meta_labeler import MetaLabelerTrainer, MetaLabelerConfig, save_meta_labeler
 
     logger.info("═" * 50)
-    logger.info("  MODO TRAIN — %s %s %s  TP=%.2f SL=%.2f Max=%d",
-                symbol, interval, period, tp_mult, sl_mult, max_bars)
+    if symbols:
+        logger.info("  MODO TRAIN (BASKET) — %d simbolos  %s %s  TP=%.2f SL=%.2f Max=%d",
+                    len(symbols), interval, period, tp_mult, sl_mult, max_bars)
+    else:
+        logger.info("  MODO TRAIN — %s %s %s  TP=%.2f SL=%.2f Max=%d",
+                    symbol, interval, period, tp_mult, sl_mult, max_bars)
     logger.info("═" * 50)
-
-    df = DataFetcher.fetch_yahoo(ticker=symbol, period=period, interval=interval)
-    if df.empty:
-        logger.error("No se pudieron obtener datos para %s", symbol)
-        sys.exit(1)
-    logger.info("Datos: %d filas [%s → %s]", len(df), df.index[0], df.index[-1])
 
     cfg = MetaLabelerConfig(tp_mult=tp_mult, sl_mult=sl_mult, max_bars=max_bars)
     trainer = MetaLabelerTrainer(config=cfg)
-    result = trainer.train(df)
+
+    if symbols:
+        dfs = {}
+        for sym in symbols:
+            df_s = DataFetcher.fetch_yahoo(ticker=sym, period=period, interval=interval)
+            if df_s is None or df_s.empty:
+                logger.warning("Sin datos para %s — se omite.", sym)
+                continue
+            dfs[sym] = df_s
+            logger.info("  %-8s : %d filas [%s → %s]",
+                        sym, len(df_s), df_s.index[0], df_s.index[-1])
+        if not dfs:
+            logger.error("Ningún símbolo del basket produjo datos.")
+            sys.exit(1)
+        result = trainer.train_multi(dfs)
+    else:
+        df = DataFetcher.fetch_yahoo(ticker=symbol, period=period, interval=interval)
+        if df.empty:
+            logger.error("No se pudieron obtener datos para %s", symbol)
+            sys.exit(1)
+        logger.info("Datos: %d filas [%s → %s]", len(df), df.index[0], df.index[-1])
+        result = trainer.train(df)
 
     logger.info("Muestras: %d  |  base_rate global: %.3f",
                 result["n_samples"], result["base_rate_global"])
     logger.info("Threshold elegido: %.3f", result["threshold"])
+    if result.get("samples_per_symbol"):
+        logger.info("Muestras por simbolo: %s", result["samples_per_symbol"])
 
     print("\n-- Metricas por fold (walk-forward) --")
     if result["fold_metrics"]:
@@ -454,6 +479,9 @@ def main() -> None:
     # ── Modo train / meta_ensemble ──
     parser.add_argument("--model", default=None,
                         help="Ruta al modelo .pkl (entrada para --strategy meta_ensemble, salida para --mode train)")
+    parser.add_argument("--symbols", default=None,
+                        help="Lista de tickers separados por coma para --mode train (basket training). "
+                             "Ej: AAPL,MSFT,NVDA,SPY,GOOGL. Si se indica, ignora --symbol.")
     parser.add_argument("--train-tp-mult", type=float, default=2.0,
                         help="Multiplicador ATR del take-profit en triple-barrier (default: 2.0)")
     parser.add_argument("--train-sl-mult", type=float, default=1.0,
@@ -498,6 +526,9 @@ def main() -> None:
         if period is None:
             period = INTERVAL_MAX_PERIOD.get(args.interval, "5y")
             logger.info("Periodo auto-seleccionado: %s (max para %s)", period, args.interval)
+        symbols_list = None
+        if args.symbols:
+            symbols_list = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
         run_train(
             symbol=args.symbol,
             period=period,
@@ -506,6 +537,7 @@ def main() -> None:
             tp_mult=args.train_tp_mult,
             sl_mult=args.train_sl_mult,
             max_bars=args.train_max_bars,
+            symbols=symbols_list,
         )
     elif args.mode == "features":
         period = args.period

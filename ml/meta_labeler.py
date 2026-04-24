@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import joblib
 import lightgbm as lgb
@@ -109,6 +109,60 @@ class MetaLabelerTrainer:
         y = meta_df.loc[X.index, "meta"].astype(int)
         meta_df = meta_df.loc[X.index]
         return X, y, meta_df
+
+    # ──────────────────────────────────────────
+    def build_dataset_multi(
+        self, dfs: Dict[str, pd.DataFrame]
+    ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+        """
+        Construye un dataset combinado sobre varios símbolos. Cada entrada de
+        `dfs` es {symbol: ohlcv_df}. Se etiqueta cada fila con la columna
+        `symbol` para trazabilidad, y se ordenan **globalmente por timestamp**
+        para que el walk-forward CV siga respetando la causalidad temporal
+        entre símbolos.
+
+        Args:
+            dfs: dict símbolo → OHLCV DataFrame.
+
+        Returns:
+            (X, y, meta_df) igual que `build_dataset`, pero con la columna
+            `symbol` en `meta_df`. Las features (`X`) sólo contienen valores
+            numéricos (no incluimos one-hot del ticker por diseño — queremos
+            un modelo que generalice a tickers fuera de muestra).
+        """
+        xs, ys, metas = [], [], []
+        for sym, df in dfs.items():
+            if df is None or df.empty:
+                continue
+            try:
+                X_s, y_s, meta_s = self.build_dataset(df)
+            except Exception as exc:  # noqa: BLE001
+                # La estrategia puede no generar señales en algún ticker.
+                print(f"[basket] {sym}: skip ({exc})")
+                continue
+            if len(X_s) == 0:
+                print(f"[basket] {sym}: 0 muestras")
+                continue
+            meta_s = meta_s.copy()
+            meta_s["symbol"] = sym
+            xs.append(X_s)
+            ys.append(y_s)
+            metas.append(meta_s)
+            print(f"[basket] {sym}: {len(X_s)} muestras  base_rate={y_s.mean():.3f}")
+
+        if not xs:
+            raise ValueError("Ningún símbolo produjo muestras válidas en el basket.")
+
+        X = pd.concat(xs, axis=0)
+        y = pd.concat(ys, axis=0)
+        meta = pd.concat(metas, axis=0)
+
+        # Ordenación global por timestamp → respeta causalidad en walk-forward.
+        order = np.argsort(X.index.to_numpy(), kind="stable")
+        X = X.iloc[order]
+        y = y.iloc[order]
+        meta = meta.iloc[order]
+        return X, y, meta
 
     # ──────────────────────────────────────────
     def walk_forward_fit(self, X: pd.DataFrame, y: pd.Series) -> dict:
@@ -205,6 +259,21 @@ class MetaLabelerTrainer:
         result["config"] = asdict(self.config)
         result["n_samples"] = int(len(X))
         result["base_rate_global"] = float(y.mean()) if len(y) else float("nan")
+        result["train_symbols"] = None
+        return result
+
+    def train_multi(self, dfs: Dict[str, pd.DataFrame]) -> dict:
+        """Entrena sobre un basket de símbolos. `dfs` = {symbol: ohlcv_df}."""
+        X, y, meta_df = self.build_dataset_multi(dfs)
+        result = self.walk_forward_fit(X, y)
+        result["config"] = asdict(self.config)
+        result["n_samples"] = int(len(X))
+        result["base_rate_global"] = float(y.mean()) if len(y) else float("nan")
+        result["train_symbols"] = list(dfs.keys())
+        result["samples_per_symbol"] = (
+            meta_df["symbol"].value_counts().to_dict()
+            if "symbol" in meta_df.columns else {}
+        )
         return result
 
 
