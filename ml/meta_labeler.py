@@ -424,6 +424,25 @@ class RegimeSplitInferencer:
             keep.loc[sub_X.index] = sub_keep.values
         return keep
 
+    def predict_proba_by_source(
+        self, X: pd.DataFrame, sources: pd.Series
+    ) -> pd.Series:
+        """
+        Como `predict_proba` pero despachando al sub-modelo correcto por
+        source. Filas sin source reconocido devuelven NaN.
+        """
+        out = pd.Series(np.nan, index=X.index, name="meta_proba")
+        sources = sources.reindex(X.index).fillna("")
+        for regime_name, inf in self.sub.items():
+            src_label = SOURCE_TREND if regime_name == "trend" else SOURCE_MR
+            mask = (sources == src_label).to_numpy()
+            if not mask.any():
+                continue
+            sub_X = X.iloc[mask]
+            sub_p = inf.predict_proba(sub_X)
+            out.loc[sub_X.index] = sub_p.values
+        return out
+
 
 def load_meta_labeler(path: str):
     """

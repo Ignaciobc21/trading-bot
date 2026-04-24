@@ -103,6 +103,41 @@ class MetaLabeledEnsembleStrategy(BaseStrategy):
         return out
 
     # ──────────────────────────────────────────
+    def predict_proba_series(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Devuelve la probabilidad de éxito estimada por el meta-modelo en cada
+        barra donde el ensemble dispara BUY. En el resto de barras el valor
+        es NaN. Pensado para el RiskOverlay (confidence-scaled sizing).
+        """
+        if self._is_split:
+            base_actions, sources = self.base.generate_signals_with_source(df)
+        else:
+            base_actions = self.base.generate_signals(df)
+            sources = None
+        features = self.feature_builder.build(df)
+
+        out = pd.Series(index=df.index, dtype=float)
+        buy_mask = base_actions == Action.BUY
+        buy_idx = df.index[buy_mask]
+        if len(buy_idx) == 0:
+            return out
+
+        feats_buy = features.loc[buy_idx]
+        valid_mask = feats_buy[self._feature_cols()].notna().all(axis=1)
+        valid_idx = feats_buy.index[valid_mask]
+        if len(valid_idx) == 0:
+            return out
+
+        X_valid = feats_buy.loc[valid_idx]
+        if self._is_split:
+            assert sources is not None
+            proba = self.inferencer.predict_proba_by_source(X_valid, sources)
+        else:
+            proba = self.inferencer.predict_proba(X_valid)
+        out.loc[valid_idx] = pd.Series(proba, index=valid_idx).values
+        return out
+
+    # ──────────────────────────────────────────
     def generate_signal(self, df: pd.DataFrame) -> StrategySignal:
         actions = self.generate_signals(df)
         action = actions.iloc[-1]

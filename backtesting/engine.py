@@ -130,6 +130,7 @@ class BacktestEngine:
         stop_loss_pct: float = STOP_LOSS_PCT,
         take_profit_pct: float = TAKE_PROFIT_PCT,
         max_holding_bars: int = MAX_HOLDING_BARS,
+        max_daily_loss_pct: float = 0.0,
     ):
         self.strategy = strategy
         self.initial_capital = initial_capital
@@ -139,22 +140,40 @@ class BacktestEngine:
         self.stop_loss_pct = stop_loss_pct / 100.0 if stop_loss_pct > 0 else 0.0
         self.take_profit_pct = take_profit_pct / 100.0 if take_profit_pct > 0 else 0.0
         self.max_holding_bars = max(0, max_holding_bars)
+        # 0 → desactivado. Si >0, cuando la pérdida intradía (pico del día vs
+        # equity actual) supera este % se bloquean BUYs hasta la siguiente
+        # sesión. Salidas de SL/TP/señal siguen funcionando.
+        self.max_daily_loss_pct = max(0.0, max_daily_loss_pct) / 100.0
 
     # ──────────────────────────────────────────
     # Ejecución
     # ──────────────────────────────────────────
-    def run(self, df: pd.DataFrame, lookback: int = 50) -> BacktestResult:
+    def run(
+        self,
+        df: pd.DataFrame,
+        lookback: int = 50,
+        size_multiplier: Optional[pd.Series] = None,
+    ) -> BacktestResult:
         """
         Ejecuta el backtest sobre un DataFrame OHLCV.
 
         Args:
             df: DataFrame con columnas 'open','high','low','close','volume'.
             lookback: barras mínimas antes de empezar a operar.
+            size_multiplier: Series opcional (mismo índice que df) con un
+                factor multiplicativo para el tamaño de posición en cada
+                entrada. Típicamente viene de un `RiskOverlay`. None equivale
+                a un multiplicador constante de 1.0.
         """
         required_cols = {"open", "high", "low", "close", "volume"}
         missing = required_cols - set(df.columns)
         if missing:
             raise ValueError(f"Faltan columnas en el DataFrame: {missing}")
+
+        if size_multiplier is None:
+            sm = pd.Series(1.0, index=df.index)
+        else:
+            sm = size_multiplier.reindex(df.index).fillna(0.0).astype(float)
 
         logger.info(
             "Iniciando backtest de '%s' — %d velas, capital=$%.2f, "
@@ -179,6 +198,11 @@ class BacktestEngine:
         equity: List[float] = [capital] * lookback  # relleno inicial
         bars_in_position = 0
 
+        # ── Kill-switch: tracking de equity intradía. ──
+        day_start_equity: Optional[float] = None
+        last_day: Optional[pd.Timestamp] = None
+        day_blocked = False  # si se disparó el kill-switch hoy, no abrir nuevos BUYs.
+
         n = len(df)
         for i in range(lookback, n):
             current_time = df.index[i]
@@ -186,6 +210,20 @@ class BacktestEngine:
             high = float(df["high"].iloc[i])
             low = float(df["low"].iloc[i])
             close = float(df["close"].iloc[i])
+
+            # Rotación de día para el kill-switch.
+            if isinstance(current_time, pd.Timestamp):
+                this_day = current_time.normalize()
+                if last_day is None or this_day != last_day:
+                    last_day = this_day
+                    # Equity al inicio del día: suma de cash + valor de posición abierta al open.
+                    if position is not None:
+                        day_start_equity = position["quantity"] * open_price + position.get(
+                            "reserved_cash", 0.0
+                        )
+                    else:
+                        day_start_equity = capital
+                    day_blocked = False
 
             # La señal del bar i-1 se ejecuta al OPEN del bar i (no look-ahead).
             prev_action = signals.iloc[i - 1] if i - 1 >= 0 else Action.HOLD
@@ -224,10 +262,32 @@ class BacktestEngine:
                     position = None
                     bars_in_position = 0
 
+            # ── Check kill-switch intradía ANTES de abrir nuevos BUYs ──
+            if (
+                self.max_daily_loss_pct > 0
+                and day_start_equity is not None
+                and not day_blocked
+            ):
+                # Equity actual al open: posición abierta mark-to-market + cash reservado,
+                # o capital si no hay posición.
+                cur_equity = (
+                    (position["quantity"] * open_price + position.get("reserved_cash", 0.0))
+                    if position is not None
+                    else capital
+                )
+                if (
+                    day_start_equity > 0
+                    and (day_start_equity - cur_equity) / day_start_equity
+                    >= self.max_daily_loss_pct
+                ):
+                    day_blocked = True
+
             # ── Ejecutar señal del bar anterior al OPEN del bar actual ──
-            if position is None and prev_action == Action.BUY:
+            if position is None and prev_action == Action.BUY and not day_blocked:
                 fill_price = open_price * (1.0 + self.slippage_pct)
-                invested = capital * self.position_size_pct
+                size_mult = float(sm.iloc[i - 1]) if i - 1 >= 0 else 1.0
+                size_mult = max(0.0, size_mult)
+                invested = capital * self.position_size_pct * size_mult
                 if invested > 0 and fill_price > 0:
                     commission = invested * self.commission_pct
                     quantity = (invested - commission) / fill_price
