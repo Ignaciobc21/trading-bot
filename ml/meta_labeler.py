@@ -39,7 +39,7 @@ from sklearn.metrics import (
 from features import FeatureBuilder
 from labels import TripleBarrierConfig, build_meta_labels
 from strategies.base import BaseStrategy
-from strategies.ensemble import build_default_ensemble
+from strategies.ensemble import build_default_ensemble, SOURCE_TREND, SOURCE_MR
 
 
 # ──────────────────────────────────────────────
@@ -93,8 +93,16 @@ class MetaLabelerTrainer:
         """
         Devuelve (X, y, meta_df). X e y están alineados por timestamp de
         entrada de cada señal BUY de la estrategia base.
+
+        Si la estrategia implementa `generate_signals_with_source(df)` (p.ej.
+        el `EnsembleStrategy`), `meta_df` incluye además una columna `source`
+        con el origen de cada BUY, útil para modelos per-régimen (P4.2).
         """
-        signals = self.strategy.generate_signals(df)
+        if hasattr(self.strategy, "generate_signals_with_source"):
+            signals, sources = self.strategy.generate_signals_with_source(df)
+        else:
+            signals = self.strategy.generate_signals(df)
+            sources = None
         features = self.feature_builder.build(df)
         tb_cfg = TripleBarrierConfig(
             tp_mult=self.config.tp_mult,
@@ -102,7 +110,7 @@ class MetaLabelerTrainer:
             max_bars=self.config.max_bars,
             atr_period=self.config.atr_period,
         )
-        _, meta_df = build_meta_labels(df, signals, tb_config=tb_cfg)
+        _, meta_df = build_meta_labels(df, signals, tb_config=tb_cfg, sources=sources)
         # Alineación estricta: para cada señal BUY tomamos el vector de
         # features de esa barra (ya disponible en el cierre).
         X = features.loc[meta_df.index].dropna()
@@ -276,6 +284,75 @@ class MetaLabelerTrainer:
         )
         return result
 
+    # ──────────────────────────────────────────
+    def train_multi_regime_split(
+        self, dfs: Dict[str, pd.DataFrame]
+    ) -> dict:
+        """
+        Entrena DOS modelos LightGBM separados, uno por tipo de señal del
+        ensemble (trend-following vs mean-reversion). Devuelve un payload
+        compatible con `save_meta_labeler` y con `RegimeSplitInferencer`
+        para uso en backtest/live.
+
+        La lógica: los BUYs producidos por Donchian (tendencia) y por
+        RSI(2) (mean-reversion) tienen microestructuras y drivers muy
+        distintos. Un único modelo tiene que aprender a identificar de qué
+        tipo es cada señal antes de predecir su éxito — ineficiente. Con
+        dos modelos especializados cada uno aprende patrones más limpios.
+
+        Requiere que `self.strategy` exponga `generate_signals_with_source`.
+        """
+        if not hasattr(self.strategy, "generate_signals_with_source"):
+            raise ValueError(
+                "La estrategia no expone 'generate_signals_with_source'. "
+                "Usa EnsembleStrategy para el entrenamiento per-régimen."
+            )
+        X, y, meta_df = self.build_dataset_multi(dfs)
+        if "source" not in meta_df.columns:
+            raise ValueError(
+                "Dataset sin columna 'source' — revisa build_dataset/meta_labels."
+            )
+
+        per_regime: Dict[str, dict] = {}
+        for regime_name, src_label in [("trend", SOURCE_TREND), ("mean_revert", SOURCE_MR)]:
+            mask = (meta_df["source"] == src_label).to_numpy()
+            if mask.sum() == 0:
+                print(f"[regime-split] {regime_name}: 0 muestras — se omite.")
+                continue
+            X_r = X.iloc[mask]
+            y_r = y.iloc[mask]
+            print(
+                f"[regime-split] {regime_name}: {len(X_r)} muestras  "
+                f"base_rate={y_r.mean():.3f}"
+            )
+            try:
+                res = self.walk_forward_fit(X_r, y_r)
+            except ValueError as exc:
+                print(f"[regime-split] {regime_name}: skip fit ({exc})")
+                continue
+            res["config"] = asdict(self.config)
+            res["n_samples"] = int(len(X_r))
+            res["base_rate_global"] = float(y_r.mean()) if len(y_r) else float("nan")
+            per_regime[regime_name] = res
+
+        if not per_regime:
+            raise ValueError("Ningún régimen produjo suficientes muestras para entrenar.")
+
+        return {
+            "kind": "regime_split",
+            "regimes": per_regime,
+            "train_symbols": list(dfs.keys()),
+            "samples_per_symbol": (
+                meta_df["symbol"].value_counts().to_dict()
+                if "symbol" in meta_df.columns else {}
+            ),
+            "samples_per_regime": (
+                meta_df["source"].value_counts().to_dict()
+                if "source" in meta_df.columns else {}
+            ),
+            "config": asdict(self.config),
+        }
+
 
 # ──────────────────────────────────────────────
 # Persistencia e inferencia
@@ -305,6 +382,56 @@ class MetaLabelerInferencer:
         return (self.predict_proba(X) >= self.threshold).rename("meta_keep")
 
 
-def load_meta_labeler(path: str) -> MetaLabelerInferencer:
+class RegimeSplitInferencer:
+    """
+    Wrapper para payloads `kind="regime_split"` que contienen dos modelos:
+    uno para señales trend-follower y otro para mean-reversion. En
+    inferencia se llama al modelo correcto según el origen (`source`) de
+    cada BUY del ensemble.
+    """
+
+    def __init__(self, payload: dict):
+        regimes = payload.get("regimes", {})
+        self.sub: Dict[str, MetaLabelerInferencer] = {
+            name: MetaLabelerInferencer(res) for name, res in regimes.items()
+        }
+        self.payload = payload
+
+    @property
+    def regimes(self) -> List[str]:
+        return list(self.sub.keys())
+
+    def threshold_for(self, regime: str) -> float:
+        return self.sub[regime].threshold if regime in self.sub else 0.5
+
+    def should_take_by_source(
+        self, X: pd.DataFrame, sources: pd.Series
+    ) -> pd.Series:
+        """
+        Devuelve una Serie booleana del mismo tamaño que `X`/`sources`:
+        True si el trade debe ejecutarse según el modelo apropiado al
+        origen de cada señal. Para filas sin origen reconocido, False.
+        """
+        keep = pd.Series(False, index=X.index, name="meta_keep")
+        sources = sources.reindex(X.index).fillna("")
+        for regime_name, inf in self.sub.items():
+            src_label = SOURCE_TREND if regime_name == "trend" else SOURCE_MR
+            mask = (sources == src_label).to_numpy()
+            if not mask.any():
+                continue
+            sub_X = X.iloc[mask]
+            sub_keep = inf.should_take(sub_X)
+            keep.loc[sub_X.index] = sub_keep.values
+        return keep
+
+
+def load_meta_labeler(path: str):
+    """
+    Carga un payload serializado. Devuelve:
+      - `RegimeSplitInferencer` si `kind == "regime_split"` (P4.2).
+      - `MetaLabelerInferencer` en caso contrario (P4 / P4.1, global).
+    """
     payload = joblib.load(path)
+    if isinstance(payload, dict) and payload.get("kind") == "regime_split":
+        return RegimeSplitInferencer(payload)
     return MetaLabelerInferencer(payload)

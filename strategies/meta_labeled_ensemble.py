@@ -12,20 +12,27 @@ tiene confianza).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Union
 
 import pandas as pd
 
 from features import FeatureBuilder
-from ml.meta_labeler import MetaLabelerInferencer, load_meta_labeler
+from ml.meta_labeler import (
+    MetaLabelerInferencer,
+    RegimeSplitInferencer,
+    load_meta_labeler,
+)
 from strategies.base import BaseStrategy, StrategySignal, Action
 from strategies.ensemble import EnsembleStrategy, build_default_ensemble
+
+
+AnyInferencer = Union[MetaLabelerInferencer, RegimeSplitInferencer]
 
 
 class MetaLabeledEnsembleStrategy(BaseStrategy):
     def __init__(
         self,
-        inferencer: MetaLabelerInferencer,
+        inferencer: AnyInferencer,
         base: Optional[EnsembleStrategy] = None,
         feature_builder: Optional[FeatureBuilder] = None,
         threshold_override: Optional[float] = None,
@@ -33,34 +40,61 @@ class MetaLabeledEnsembleStrategy(BaseStrategy):
         self.inferencer = inferencer
         self.base = base or build_default_ensemble()
         self.feature_builder = feature_builder or FeatureBuilder()
+        self._is_split = isinstance(inferencer, RegimeSplitInferencer)
+        # Solo aplicable al modelo global. En modo split cada sub-modelo
+        # lleva su propio threshold calibrado por fold.
         self.threshold = (
-            threshold_override if threshold_override is not None else inferencer.threshold
+            threshold_override
+            if threshold_override is not None
+            else (inferencer.threshold if not self._is_split else float("nan"))
         )
-        self.name = f"MetaLabeled[{self.base.name}] thr={self.threshold:.2f}"
+        tag = "split" if self._is_split else f"thr={self.threshold:.2f}"
+        self.name = f"MetaLabeled[{self.base.name}] {tag}"
 
     # ──────────────────────────────────────────
+    def _feature_cols(self) -> list[str]:
+        """Conjunto de features necesarias para la inferencia, en modo
+        global o split."""
+        if self._is_split:
+            cols: list[str] = []
+            seen = set()
+            for inf in self.inferencer.sub.values():
+                for c in inf.feature_cols:
+                    if c not in seen:
+                        cols.append(c)
+                        seen.add(c)
+            return cols
+        return self.inferencer.feature_cols
+
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
-        base_actions = self.base.generate_signals(df)
+        if self._is_split:
+            base_actions, sources = self.base.generate_signals_with_source(df)
+        else:
+            base_actions = self.base.generate_signals(df)
+            sources = None
         features = self.feature_builder.build(df)
 
         # Candidates = todas las barras con BUY.
         buy_mask = base_actions == Action.BUY
         buy_idx = df.index[buy_mask]
-        # Las features del modelo pueden tener NaNs en los primeros bars;
-        # sólo evaluamos las que tienen todas las columnas disponibles.
         feats_buy = features.loc[buy_idx]
-        valid_mask = feats_buy[self.inferencer.feature_cols].notna().all(axis=1)
+        valid_mask = feats_buy[self._feature_cols()].notna().all(axis=1)
         valid_idx = feats_buy.index[valid_mask]
 
         if len(valid_idx) > 0:
-            proba = self.inferencer.predict_proba(feats_buy.loc[valid_idx])
-            keep = proba >= self.threshold
-            rejected = valid_idx[~keep.to_numpy()]
+            if self._is_split:
+                keep = self.inferencer.should_take_by_source(
+                    feats_buy.loc[valid_idx], sources
+                )
+                rejected = valid_idx[~keep.to_numpy()]
+            else:
+                proba = self.inferencer.predict_proba(feats_buy.loc[valid_idx])
+                keep = proba >= self.threshold
+                rejected = valid_idx[~keep.to_numpy()]
         else:
             rejected = pd.Index([])
 
-        # Las barras candidatas con features incompletas también se rechazan
-        # (no queremos abrir a ciegas).
+        # Las barras con features incompletas se rechazan (no abrimos a ciegas).
         rejected = rejected.union(feats_buy.index[~valid_mask])
 
         out = base_actions.copy()
