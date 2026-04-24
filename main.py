@@ -104,6 +104,12 @@ def run_backtest(
     save_plot: Optional[str] = None,
     model_path: Optional[str] = None,
     threshold_override: Optional[float] = None,
+    risk_overlay: bool = False,
+    target_vol: float = 0.20,
+    vol_mult_cap: float = 1.50,
+    max_daily_loss_pct: float = 0.0,
+    use_regime_sizing: bool = True,
+    use_confidence_sizing: bool = True,
 ) -> None:
     """Descarga datos y ejecuta un backtest con la estrategia seleccionada."""
     from data.fetcher import DataFetcher
@@ -128,7 +134,43 @@ def run_backtest(
         model_path=model_path, threshold_override=threshold_override,
     )
 
-    # 3. Ejecutar backtest
+    # 3. Risk overlay opcional
+    size_multiplier = None
+    if risk_overlay:
+        from risk import RiskConfig, RiskOverlay
+        from strategies.regime import RegimeDetector
+
+        cfg = RiskConfig(
+            target_vol=target_vol,
+            vol_mult_cap=vol_mult_cap,
+            use_confidence_sizing=use_confidence_sizing,
+            max_daily_loss_pct=max_daily_loss_pct,
+        )
+        overlay = RiskOverlay(cfg)
+
+        regime_series = None
+        if use_regime_sizing:
+            regime_series = RegimeDetector().classify(df)
+
+        proba_series = None
+        if use_confidence_sizing and hasattr(strategy, "predict_proba_series"):
+            try:
+                proba_series = strategy.predict_proba_series(df)
+            except Exception as exc:  # fail-open: seguimos sin confidence sizing.
+                logger.warning("predict_proba_series falló (%s); deshabilitando confidence sizing.", exc)
+                proba_series = None
+
+        size_multiplier = overlay.size_multiplier(df, regime=regime_series, proba=proba_series)
+        mean_mult = float(size_multiplier.dropna().mean()) if len(size_multiplier.dropna()) else 0.0
+        logger.info(
+            "Risk overlay ON — target_vol=%.2f vol_cap=%.2f regime=%s conf=%s daily_loss=%.1f%% avg_mult=%.3f",
+            target_vol, vol_mult_cap,
+            "on" if use_regime_sizing else "off",
+            "on" if use_confidence_sizing and proba_series is not None else "off",
+            max_daily_loss_pct, mean_mult,
+        )
+
+    # 4. Ejecutar backtest
     engine = BacktestEngine(
         strategy=strategy,
         initial_capital=INITIAL_CAPITAL,
@@ -138,8 +180,9 @@ def run_backtest(
         stop_loss_pct=stop_loss_pct,
         take_profit_pct=take_profit_pct,
         max_holding_bars=max_holding_bars,
+        max_daily_loss_pct=max_daily_loss_pct if risk_overlay else 0.0,
     )
-    result = engine.run(df, lookback=lookback)
+    result = engine.run(df, lookback=lookback, size_multiplier=size_multiplier)
 
     # 4. Mostrar resultados
     print(result.summary())
@@ -523,6 +566,19 @@ def main() -> None:
     parser.add_argument("--regime-split", action="store_true",
                         help="P4.2: entrena dos modelos separados (trend-follow y mean-revert) "
                              "en un único .pkl. Requiere --symbols.")
+    # ── P6: Risk overlay ──
+    parser.add_argument("--risk-overlay", action="store_true",
+                        help="P6: activa el risk overlay (vol targeting + regime + confidence sizing).")
+    parser.add_argument("--target-vol", type=float, default=0.20,
+                        help="Volatilidad anualizada objetivo para el vol-targeting (default: 0.20 = 20%%).")
+    parser.add_argument("--vol-mult-cap", type=float, default=1.50,
+                        help="Tope del multiplicador por vol targeting (default: 1.5 = hasta 150%% del sizing base).")
+    parser.add_argument("--max-daily-loss-pct", type=float, default=0.0,
+                        help="Kill-switch diario: si la pérdida intradía supera X%%, bloquea BUYs hasta el día siguiente. 0 = desactivado.")
+    parser.add_argument("--no-regime-sizing", action="store_true",
+                        help="Desactiva el escalado por régimen dentro del risk overlay.")
+    parser.add_argument("--no-confidence-sizing", action="store_true",
+                        help="Desactiva el escalado por confianza del meta-modelo.")
 
     args = parser.parse_args()
 
@@ -550,6 +606,12 @@ def main() -> None:
             save_plot=args.save_plot,
             model_path=args.model,
             threshold_override=args.train_threshold,
+            risk_overlay=args.risk_overlay,
+            target_vol=args.target_vol,
+            vol_mult_cap=args.vol_mult_cap,
+            max_daily_loss_pct=args.max_daily_loss_pct,
+            use_regime_sizing=not args.no_regime_sizing,
+            use_confidence_sizing=not args.no_confidence_sizing,
         )
     elif args.mode == "train":
         if not args.model:
