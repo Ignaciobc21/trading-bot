@@ -272,10 +272,10 @@ def run_portfolio(
         corr_window=corr_window,
     )
     engine = PortfolioBacktestEngine(strategy=strategy, config=cfg)
-    result = engine.run(data, lookback=lookback)
-
-    # 4. Imprimir resumen humano.
-    print(result.summary())
+    # El motor ya llama a `logger.info(result.summary())` internamente.
+    # No imprimimos por stdout para evitar UnicodeEncodeError en consolas
+    # Windows con codepage cp1252 (los caracteres `═` y `─` no encajan).
+    engine.run(data, lookback=lookback)
 
 
 # ═══════════════════════════════════════════════
