@@ -77,6 +77,11 @@ class LiveConfig:
     yahoo_interval: str = "1h"
     # Notificaciones Telegram.
     send_telegram: bool = True
+    # Dashboard (H): si se especifica, el runner escribe un snapshot
+    # JSON tras cada iteración con estado actual + histórico para que
+    # `dashboard/app.py` pueda monitorizarlo en vivo.
+    state_path: Optional[str] = None
+    state_history_size: int = 200        # nº máximo de decisiones a guardar en el snapshot.
     # Opcional: filtro de horario de mercado (09:30-16:00 NY). Evita que el
     # bot intente operar con quotes rancios en horario cerrado.
     only_market_hours: bool = False
@@ -233,10 +238,15 @@ class LiveRunner:
         # llamadas redundantes al API dentro de una misma iteración.
         self._open_positions_cache: List[Dict] = []
         self._iter_count: int = 0
+        # Histórico de decisiones para el dashboard (deque circular limitado
+        # por `state_history_size`). Se popula tras cada iteración.
+        self._decision_history: List[Dict[str, Any]] = []
 
         # Validaciones básicas.
         if self.config.dry_run:
             logger.warning("LIVE RUNNER EN MODO DRY-RUN — no se enviarán órdenes reales.")
+        if self.config.state_path:
+            logger.info("State snapshot habilitado — escritura cada iter en %s", self.config.state_path)
 
     # ──────────────────────────────────────────
     def _notify(self, msg: str) -> None:
@@ -473,12 +483,108 @@ class LiveRunner:
         else:
             action_str = "HOLD"
 
-        return LiveDecision(
+        decision = LiveDecision(
             timestamp=last_ts, action=action_str, reason=reason,
             price=last_price, size_multiplier=size_mult, proba=proba,
             executed=executed,
             extras={"n_open_positions": len(self._open_positions_cache)},
         )
+
+        # Snapshot para el dashboard (H). Se escribe siempre que se haya
+        # configurado `state_path`, sin importar si la iter cerró trade o no.
+        if self.config.state_path:
+            try:
+                self._write_state_snapshot(decision, df)
+            except Exception as exc:
+                # Una escritura de snapshot fallida no debe romper el bot.
+                logger.warning("Snapshot dashboard falló: %s", exc)
+
+        return decision
+
+    # ──────────────────────────────────────────
+    def _write_state_snapshot(self, decision: LiveDecision, df: pd.DataFrame) -> None:
+        """
+        Escribe un snapshot JSON con el estado actual del bot.
+
+        El dashboard (`dashboard/app.py`) lee este archivo y lo refresca
+        cada pocos segundos. El formato es estable y backward-compatible:
+        se añaden campos nuevos al final, nunca se renombran ni se
+        eliminan los existentes.
+
+        Diseño: se escribe a un fichero temporal y se hace `os.replace`
+        atómico, para evitar que el dashboard lea un JSON parcial si
+        coincide con el momento de escritura.
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        cfg = self.config
+        # Anexar la decisión actual al histórico circular.
+        hist_entry = {
+            "iter": self._iter_count,
+            "timestamp": decision.timestamp.isoformat() if hasattr(decision.timestamp, "isoformat") else str(decision.timestamp),
+            "action": decision.action,
+            "price": decision.price,
+            "size_multiplier": decision.size_multiplier,
+            "proba": decision.proba,
+            "executed": decision.executed,
+            "reason": decision.reason,
+        }
+        self._decision_history.append(hist_entry)
+        if len(self._decision_history) > cfg.state_history_size:
+            # Mantener sólo los últimos N para que el JSON no crezca sin
+            # límite en runs largos.
+            self._decision_history = self._decision_history[-cfg.state_history_size:]
+
+        # Información del modelo (si la estrategia es meta_ensemble).
+        model_info: Dict[str, Any] = {}
+        infer = getattr(self.strategy, "inferencer", None)
+        if infer is not None:
+            model_info["threshold"] = getattr(self.strategy, "threshold", None)
+            # `_is_split` es True para regime-split; sirve para que el
+            # dashboard muestre etiqueta "split" vs "global".
+            model_info["regime_split"] = getattr(self.strategy, "_is_split", False)
+
+        # Sentiment "spot" (último valor de F&G y último news_sent_24h_mean
+        # si están disponibles en el DataFrame).
+        sent_info: Dict[str, Any] = {}
+        if df is not None and not df.empty:
+            for col in ("fng_value", "fng_class_idx", "news_sent_24h_mean", "news_sent_24h_count"):
+                if col in df.columns:
+                    val = df[col].dropna()
+                    if len(val) > 0:
+                        sent_info[col] = float(val.iloc[-1])
+
+        snapshot = {
+            "schema_version": 1,
+            "updated_at": pd.Timestamp.utcnow().isoformat(),
+            "symbol": cfg.symbol,
+            "timeframe": cfg.timeframe,
+            "strategy": self.strategy.name,
+            "dry_run": cfg.dry_run,
+            "data_source": cfg.data_source,
+            "iter_count": self._iter_count,
+            "max_iters": cfg.max_iters,
+            # Snapshot de la decisión más reciente.
+            "last_decision": hist_entry,
+            # Posiciones abiertas conocidas por el cache (no son la
+            # source of truth — el broker lo es — pero suelen coincidir).
+            "open_positions": [
+                {k: v for k, v in p.items() if k in {"symbol", "qty", "avg_entry_price", "side", "unrealized_pl"}}
+                for p in self._open_positions_cache
+            ],
+            "model": model_info,
+            "sentiment_spot": sent_info,
+            "history": self._decision_history,
+        }
+
+        path = Path(cfg.state_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2, default=str)
+        os.replace(tmp, path)
 
     # ──────────────────────────────────────────
     def run(self) -> None:

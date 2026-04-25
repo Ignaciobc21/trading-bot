@@ -30,6 +30,14 @@ joblib>=1.3.0
 # en las columnas de noticias y LightGBM lo maneja sin romperse.
 vaderSentiment>=3.3.2
 
+# ─── Dashboard (H) ─────────────────────────
+# Streamlit sirve el panel y plotly hace los charts interactivos.
+# Se invoca con `python main.py --mode dashboard`. Si no necesitas
+# el dashboard, puedes comentar estas dos deps; el resto del bot
+# funciona igual sin ellas.
+streamlit>=1.30.0
+plotly>=5.20.0
+
 # ─── Utilities ───
 python-dotenv>=1.0.0
 requests>=2.31.0

@@ -110,6 +110,7 @@ def run_backtest(
     max_daily_loss_pct: float = 0.0,
     use_regime_sizing: bool = True,
     use_confidence_sizing: bool = True,
+    save_result: Optional[str] = None,
 ) -> None:
     """Descarga datos y ejecuta un backtest con la estrategia seleccionada."""
     from data.fetcher import DataFetcher
@@ -198,6 +199,35 @@ def run_backtest(
     # 6. Graficar
     engine.plot_results(result, save_path=save_plot)
 
+    # 7. Persistir resultado para el dashboard (H).
+    if save_result:
+        _save_result_pickle(result, save_result, kind="backtest", symbol=symbol)
+
+
+def _save_result_pickle(result, path: str, kind: str, symbol: Optional[str] = None) -> None:
+    """
+    Persiste un BacktestResult o PortfolioResult en pickle, junto con un
+    sidecar JSON con metadata legible (kind, symbol, fecha) para el
+    dashboard.
+
+    Uso de pickle: las clases tienen pandas Series y dataclasses con
+    campos no triviales; pickle es lo más fiel y compacto. JSON sólo
+    se usa para el header del archivo, no para los datos.
+    """
+    import pickle
+    from pathlib import Path
+
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "wb") as f:
+        pickle.dump({
+            "kind": kind,
+            "symbol": symbol,
+            "result": result,
+            "saved_at": pd.Timestamp.utcnow().isoformat(),
+        }, f)
+    logger.info("Resultado %s guardado en %s", kind, p)
+
 
 # ═══════════════════════════════════════════════
 #  MODO PORTFOLIO  (G — backtest multi-symbol)
@@ -218,6 +248,7 @@ def run_portfolio(
     max_positions: int = 5,
     corr_threshold: Optional[float] = 0.75,
     corr_window: int = 60,
+    save_result: Optional[str] = None,
 ) -> None:
     """
     G — Backtest multi-símbolo con capital compartido y correlation guard.
@@ -275,7 +306,10 @@ def run_portfolio(
     # El motor ya llama a `logger.info(result.summary())` internamente.
     # No imprimimos por stdout para evitar UnicodeEncodeError en consolas
     # Windows con codepage cp1252 (los caracteres `═` y `─` no encajan).
-    engine.run(data, lookback=lookback)
+    result = engine.run(data, lookback=lookback)
+
+    if save_result:
+        _save_result_pickle(result, save_result, kind="portfolio", symbol=",".join(symbols))
 
 
 # ═══════════════════════════════════════════════
@@ -507,6 +541,7 @@ def run_live(
     take_profit_pct: float = 0.0,
     max_iters: Optional[int] = None,
     sleep_seconds: Optional[int] = None,
+    state_path: Optional[str] = None,
 ) -> None:
     """
     Ejecuta el bot en modo live o paper trading.
@@ -628,6 +663,7 @@ def run_live(
         max_iters=max_iters,
         sleep_seconds=sleep_seconds,
         yahoo_interval=yahoo_interval,
+        state_path=state_path,
     )
 
     runner = LiveRunner(
@@ -698,7 +734,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["live", "backtest", "features", "train", "portfolio"],
+        choices=["live", "backtest", "features", "train", "portfolio", "dashboard"],
         default="backtest",
         help="Modo de ejecucion (default: backtest). 'features' vuelca el DataFrame; 'train' entrena meta-labeler ML.",
     )
@@ -813,6 +849,14 @@ def main() -> None:
                         help="E: limite de iteraciones (None = infinito). Útil para test.")
     parser.add_argument("--live-sleep", type=int, default=None,
                         help="E: override de los segundos de sleep entre iteraciones.")
+    parser.add_argument("--state-path", default=None,
+                        help="H: path de un JSON donde el LiveRunner escribe un snapshot tras cada "
+                             "iteración para que el dashboard pueda monitorizarlo en vivo.")
+    parser.add_argument("--save-result", default=None,
+                        help="H: path para persistir el resultado del backtest/portfolio (pickle). "
+                             "Útil para revisarlo después en el dashboard.")
+    parser.add_argument("--dashboard-port", type=int, default=8501,
+                        help="H: puerto para --mode dashboard (default 8501).")
     # ── G: Portfolio (multi-symbol) ──
     parser.add_argument("--max-positions", type=int, default=5,
                         help="G: nº máximo de posiciones simultáneas en --mode portfolio (default: 5).")
@@ -858,6 +902,7 @@ def main() -> None:
             max_daily_loss_pct=args.max_daily_loss_pct,
             use_regime_sizing=not args.no_regime_sizing,
             use_confidence_sizing=not args.no_confidence_sizing,
+            save_result=args.save_result,
         )
     elif args.mode == "train":
         if not args.model:
@@ -925,7 +970,34 @@ def main() -> None:
             max_positions=args.max_positions,
             corr_threshold=args.corr_threshold,
             corr_window=args.corr_window,
+            save_result=args.save_result,
         )
+    elif args.mode == "dashboard":
+        # H — Lanza el dashboard Streamlit. El binario `streamlit` debe
+        # estar instalado en el venv (incluido en requirements.txt).
+        import subprocess
+        from pathlib import Path
+
+        app_path = Path(__file__).parent / "dashboard" / "app.py"
+        if not app_path.exists():
+            logger.error("No encuentro %s", app_path)
+            sys.exit(2)
+        cmd = [
+            sys.executable, "-m", "streamlit", "run", str(app_path),
+            "--server.port", str(args.dashboard_port),
+            "--server.headless", "true",
+            "--browser.gatherUsageStats", "false",
+            "--",
+        ]
+        # Pasar paths configurados al app vía args posicionales.
+        if args.state_path:
+            cmd += ["--state-path", args.state_path]
+        if args.save_result:
+            cmd += ["--result-path", args.save_result]
+        if args.model:
+            cmd += ["--model-path", args.model]
+        logger.info("Arrancando dashboard: %s", " ".join(cmd))
+        subprocess.run(cmd, check=False)
     elif args.mode == "live":
         run_live(
             symbol=args.symbol,
@@ -944,6 +1016,7 @@ def main() -> None:
             take_profit_pct=args.take_profit_pct,
             max_iters=args.live_max_iters,
             sleep_seconds=args.live_sleep,
+            state_path=args.state_path,
         )
 
 
