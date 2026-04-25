@@ -16,7 +16,7 @@ import argparse
 import time
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import pandas as pd
 
@@ -197,6 +197,85 @@ def run_backtest(
 
     # 6. Graficar
     engine.plot_results(result, save_path=save_plot)
+
+
+# ═══════════════════════════════════════════════
+#  MODO PORTFOLIO  (G — backtest multi-symbol)
+# ═══════════════════════════════════════════════
+def run_portfolio(
+    symbols: list,
+    period: str,
+    interval: str,
+    strategy_name: str = "meta_ensemble",
+    model_path: Optional[str] = None,
+    threshold_override: Optional[float] = None,
+    position_size_pct: float = 20.0,
+    stop_loss_pct: float = 0.0,
+    take_profit_pct: float = 0.0,
+    slippage_pct: float = SLIPPAGE_PCT,
+    commission_pct: float = COMMISSION_PCT,
+    max_holding_bars: int = 0,
+    max_positions: int = 5,
+    corr_threshold: Optional[float] = 0.75,
+    corr_window: int = 60,
+) -> None:
+    """
+    G — Backtest multi-símbolo con capital compartido y correlation guard.
+
+    Reutiliza la misma `BaseStrategy` que el backtest single-symbol; la
+    única diferencia es el motor: `PortfolioBacktestEngine` itera todos
+    los símbolos en paralelo sobre un índice maestro común.
+    """
+    from data.fetcher import DataFetcher
+    from backtesting.portfolio_engine import PortfolioBacktestEngine, PortfolioConfig
+
+    logger.info("═" * 50)
+    logger.info("  MODO PORTFOLIO — strategy=%s  symbols=%s", strategy_name, ",".join(symbols))
+    logger.info("═" * 50)
+
+    # 1. Descargar datos para cada símbolo y filtrar los que se hayan
+    # devuelto vacíos (delisted, ticker mal escrito, etc.).
+    data: Dict[str, "pd.DataFrame"] = {}
+    for sym in symbols:
+        df = DataFetcher.fetch_yahoo(ticker=sym, period=period, interval=interval)
+        if df.empty:
+            logger.warning("Sin datos para %s — se descarta.", sym)
+            continue
+        df.attrs["symbol"] = sym
+        data[sym] = df
+        logger.info("  %-8s : %d filas [%s → %s]", sym, len(df), df.index[0], df.index[-1])
+
+    if not data:
+        logger.error("Ningún símbolo produjo datos válidos.")
+        sys.exit(1)
+
+    # 2. Estrategia. Lookback se hereda de la factoría; todos los
+    # símbolos comparten la misma estrategia (lo cual es correcto: el
+    # ensemble es genérico, no específico por ticker).
+    strategy, lookback = _build_strategy(
+        strategy_name, use_trend_filter=False, trend_ema_period=TREND_EMA_PERIOD,
+        model_path=model_path, threshold_override=threshold_override,
+    )
+
+    # 3. Motor de cartera.
+    cfg = PortfolioConfig(
+        initial_capital=INITIAL_CAPITAL,
+        commission_pct=commission_pct,
+        slippage_pct=slippage_pct,
+        position_size_pct=position_size_pct,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        max_holding_bars=max_holding_bars,
+        max_positions=max_positions,
+        # El usuario puede desactivar el guard pasando un threshold > 1.
+        corr_threshold=corr_threshold if (corr_threshold is not None and corr_threshold <= 1.0) else None,
+        corr_window=corr_window,
+    )
+    engine = PortfolioBacktestEngine(strategy=strategy, config=cfg)
+    result = engine.run(data, lookback=lookback)
+
+    # 4. Imprimir resumen humano.
+    print(result.summary())
 
 
 # ═══════════════════════════════════════════════
@@ -619,7 +698,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["live", "backtest", "features", "train"],
+        choices=["live", "backtest", "features", "train", "portfolio"],
         default="backtest",
         help="Modo de ejecucion (default: backtest). 'features' vuelca el DataFrame; 'train' entrena meta-labeler ML.",
     )
@@ -734,6 +813,18 @@ def main() -> None:
                         help="E: limite de iteraciones (None = infinito). Útil para test.")
     parser.add_argument("--live-sleep", type=int, default=None,
                         help="E: override de los segundos de sleep entre iteraciones.")
+    # ── G: Portfolio (multi-symbol) ──
+    parser.add_argument("--max-positions", type=int, default=5,
+                        help="G: nº máximo de posiciones simultáneas en --mode portfolio (default: 5).")
+    parser.add_argument("--corr-threshold", type=float, default=0.75,
+                        help="G: umbral de correlación rolling media para rechazar nuevas entradas "
+                             "que solapen con las posiciones abiertas (default: 0.75). Negativo o "
+                             "muy alto desactiva el guard.")
+    parser.add_argument("--corr-window", type=int, default=60,
+                        help="G: ventana en barras para la matriz de correlación rolling (default: 60).")
+    parser.add_argument("--portfolio-position-size-pct", type=float, default=20.0,
+                        help="G: % del equity total invertido en cada nueva entrada (default: 20%%). "
+                             "Con max_positions=5 se llega a ~100%% sin apalancar.")
 
     args = parser.parse_args()
 
@@ -807,6 +898,33 @@ def main() -> None:
             include_hurst=not args.features_no_hurst,
             use_cache=not args.features_no_cache,
             include_sentiment=args.include_sentiment,
+        )
+    elif args.mode == "portfolio":
+        # G — Backtest multi-symbol.
+        period = args.period
+        if period is None:
+            period = INTERVAL_MAX_PERIOD.get(args.interval, "1y")
+            logger.info("Periodo auto-seleccionado: %s (max para %s)", period, args.interval)
+        if not args.symbols:
+            logger.error("--mode portfolio requiere --symbols (lista separada por comas).")
+            sys.exit(1)
+        symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+        run_portfolio(
+            symbols=symbols,
+            period=period,
+            interval=args.interval,
+            strategy_name=args.strategy,
+            model_path=args.model,
+            threshold_override=args.train_threshold,
+            position_size_pct=args.portfolio_position_size_pct,
+            stop_loss_pct=args.stop_loss_pct,
+            take_profit_pct=args.take_profit_pct,
+            slippage_pct=args.slippage_pct,
+            commission_pct=args.commission_pct,
+            max_holding_bars=args.max_holding_bars,
+            max_positions=args.max_positions,
+            corr_threshold=args.corr_threshold,
+            corr_window=args.corr_window,
         )
     elif args.mode == "live":
         run_live(
