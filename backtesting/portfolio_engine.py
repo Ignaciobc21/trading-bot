@@ -53,6 +53,14 @@ from config.settings import (
     TAKE_PROFIT_PCT,
     MAX_HOLDING_BARS,
 )
+# I — Cost model pluggable. Si no se inyecta uno en PortfolioConfig, el
+# motor construye un FlatCostModel con los flags clásicos para dar los
+# mismos números que antes.
+from execution.costs import (
+    CostModel,
+    FlatCostModel,
+    compute_adv_notional,
+)
 from strategies.base import Action, BaseStrategy
 from utils.logger import get_logger
 
@@ -96,6 +104,8 @@ class PortfolioResult:
     trades: List[dict] = field(default_factory=list)
     equity_curve: Optional[pd.Series] = None
     concurrent_positions_curve: Optional[pd.Series] = None
+    # I — Coste medio round-trip (entry+exit) en bps. 0 si no hay trades.
+    avg_cost_bps: float = 0.0
 
     def summary(self) -> str:
         """Resumen humano-legible del backtest de cartera."""
@@ -120,6 +130,10 @@ class PortfolioResult:
             f"  Avg concurrent  : {self.avg_concurrent_positions:.2f}",
             f"  Rejected (corr) : {self.rejected_by_corr}",
             f"  Rejected (cap)  : {self.rejected_by_max_positions}",
+        ]
+        if self.avg_cost_bps > 0:
+            lines.append(f"  Avg cost/trade  : {self.avg_cost_bps:.1f} bps")
+        lines += [
             "─" * 60,
             "  Desglose por símbolo:",
         ]
@@ -161,6 +175,11 @@ class PortfolioConfig:
     # Mínimo de barras observadas en el rolling antes de aplicar el
     # guard. Si hay menos historia, no rechazamos por corr (no fiable).
     corr_min_obs: int = 30
+    # I — Cost model opcional. Si None, el motor construye FlatCostModel
+    # con los `commission_pct`/`slippage_pct` de arriba (retro-compat).
+    # Para backtests "honestos" usa `RealisticCostModel` con spread
+    # variable, market impact, etc.
+    cost_model: Optional[CostModel] = None
 
 
 # ──────────────────────────────────────────────
@@ -186,6 +205,13 @@ class PortfolioBacktestEngine:
         self._pos_size = max(0.0, min(self.cfg.position_size_pct, 100.0)) / 100.0
         self._sl = self.cfg.stop_loss_pct / 100.0 if self.cfg.stop_loss_pct > 0 else 0.0
         self._tp = self.cfg.take_profit_pct / 100.0 if self.cfg.take_profit_pct > 0 else 0.0
+        # I — Cost model. Si no viene inyectado, fabricamos el flat con los
+        # flags clásicos. El atributo público permite al caller consultar
+        # cuánto cuesta el modelo en bps (`cost_model.commission_rate()`).
+        self.cost_model: CostModel = self.cfg.cost_model or FlatCostModel(
+            commission_pct=self.cfg.commission_pct,
+            slippage_pct=self.cfg.slippage_pct,
+        )
 
     # ──────────────────────────────────────────
     # API pública
@@ -225,10 +251,14 @@ class PortfolioBacktestEngine:
         symbols = sorted(data.keys())  # orden estable y reproducible.
         n_syms = len(symbols)
 
-        # 1. Pre-computar señales y close-series para correlación.
+        # 1. Pre-computar señales, close-series y ADV por símbolo.
         signals_by_sym: Dict[str, pd.Series] = {}
         close_by_sym: Dict[str, pd.Series] = {}
         size_mult_by_sym: Dict[str, pd.Series] = {}
+        # I — ADV por símbolo (para market impact del cost model). La
+        # ventana 20 barras es estándar. NaN en warm-up → el cost model
+        # no aplica impact (se comporta como spread + commission solo).
+        adv_by_sym: Dict[str, pd.Series] = {}
         for sym in symbols:
             df = data[sym]
             # Anotar el ticker en attrs por si la estrategia construye
@@ -237,6 +267,7 @@ class PortfolioBacktestEngine:
             sig = self.strategy.generate_signals(df)
             signals_by_sym[sym] = sig.reindex(df.index)
             close_by_sym[sym] = df["close"].astype(float)
+            adv_by_sym[sym] = compute_adv_notional(df, window=20)
             if size_multipliers and sym in size_multipliers:
                 size_mult_by_sym[sym] = (
                     size_multipliers[sym].reindex(df.index).fillna(0.0).astype(float)
@@ -249,12 +280,16 @@ class PortfolioBacktestEngine:
         # diferente fecha de listado (ej. una IPO posterior).
         master_index = pd.DatetimeIndex(sorted(set().union(*[df.index for df in data.values()])))
         n = len(master_index)
+        # I — Detectar si trabajamos con daily bars en el master index.
+        # El cost model ajusta el spread factor según esto.
+        is_daily_bar = _periods_per_year(master_index) < 300
         logger.info(
             "Portfolio backtest: %d símbolos, %d barras [%s → %s], "
-            "max_positions=%s, corr≤%s (window=%d), pos_size=%.1f%%",
+            "max_positions=%s, corr≤%s (window=%d), pos_size=%.1f%%, cost_model=%s",
             n_syms, n, master_index[0], master_index[-1],
             self.cfg.max_positions, self.cfg.corr_threshold,
             self.cfg.corr_window, self._pos_size * 100,
+            getattr(self.cost_model, "name", "flat"),
         )
 
         # 3. Construir DataFrame de log-returns para correlación rolling.
@@ -324,6 +359,8 @@ class PortfolioBacktestEngine:
                     exit_reason = "MAX_HOLDING"
 
                 if exit_price is not None:
+                    # I — Cierre por stop/TP/MAX_HOLDING: sin slippage extra
+                    # (el trigger es pesimista); commission vía cost_model.
                     proceeds = self._close(pos, exit_price, t, sym, trades, exit_reason)
                     cash += proceeds
                     positions.pop(sym, None)
@@ -341,8 +378,20 @@ class PortfolioBacktestEngine:
                 prev_action = signals_by_sym[sym].iloc[j - 1]
                 if prev_action != Action.SELL:
                     continue
-                fill = float(df["open"].iloc[j]) * (1.0 - self._slip)
-                proceeds = self._close(positions[sym], fill, t, sym, trades, "SIGNAL")
+                # I — Salida por SEÑAL: cost_model aplica slippage + commission.
+                mid = float(df["open"].iloc[j])
+                pos = positions[sym]
+                notional = pos["quantity"] * mid
+                adv_val = self._adv_at(adv_by_sym, sym, j)
+                cb = self.cost_model.apply(
+                    mid=mid, side="SELL", notional=notional,
+                    bar_time=t if isinstance(t, pd.Timestamp) else None,
+                    adv_notional=adv_val, is_daily_bar=is_daily_bar,
+                )
+                proceeds = self._close(
+                    pos, cb.fill_price, t, sym, trades, "SIGNAL",
+                    exit_cost_bps=cb.total_cost_bps,
+                )
                 cash += proceeds
                 positions.pop(sym, None)
 
@@ -351,7 +400,10 @@ class PortfolioBacktestEngine:
             #   1. cap de posiciones (max_positions),
             #   2. cash disponible,
             #   3. correlation guard.
-            buy_candidates: List[Tuple[str, float, float]] = []  # (sym, fill, size_mult)
+            # buy_candidates: tuplas (sym, mid_price, size_mult, j, adv).
+            # Posponemos el cálculo del fill_price real al cost_model para
+            # poder pasar el notional ya dimensionado (impact depende de él).
+            buy_candidates: List[Tuple[str, float, float, int, Optional[float]]] = []
             for sym in symbols:
                 if sym in positions:
                     continue  # ya estamos dentro.
@@ -367,10 +419,11 @@ class PortfolioBacktestEngine:
                 size_mult = float(size_mult_by_sym[sym].iloc[j - 1])
                 if size_mult <= 0:
                     continue
-                fill = float(df["open"].iloc[j]) * (1.0 + self._slip)
-                buy_candidates.append((sym, fill, size_mult))
+                mid = float(df["open"].iloc[j])
+                adv_val = self._adv_at(adv_by_sym, sym, j)
+                buy_candidates.append((sym, mid, size_mult, j, adv_val))
 
-            for sym, fill, size_mult in buy_candidates:
+            for sym, mid, size_mult, j, adv_val in buy_candidates:
                 # ── 1. Cap de posiciones ─────────────────────────
                 if (
                     self.cfg.max_positions is not None
@@ -408,15 +461,24 @@ class PortfolioBacktestEngine:
                 # posiciones abiertas valen mucho, las nuevas también
                 # son proporcionales.
                 equity_total = cash + self._mark_to_market(positions, master_index, i, close_panel)
-                # `size_mult` ya viene del bar j-1 del propio símbolo (no
-                # del master_index) — se calculó en `buy_candidates`.
                 target_invest = equity_total * self._pos_size * size_mult
                 # Cap por cash disponible (no apalancamos).
                 invested = min(target_invest, cash)
-                if invested <= 0 or fill <= 0:
+                if invested <= 0 or mid <= 0:
                     continue
-                commission = invested * self._comm
-                quantity = (invested - commission) / fill
+                # I — Cost model: consulta fill_price (con slippage+impact) y
+                # commission. `impact` depende del notional, por eso no se
+                # pre-calculaba antes. Para portfolios con muchos símbolos
+                # small-cap esto puede hacer un impact grande en tickers
+                # poco líquidos aunque el tamaño absoluto sea modesto.
+                cb = self.cost_model.apply(
+                    mid=mid, side="BUY", notional=invested,
+                    bar_time=t if isinstance(t, pd.Timestamp) else None,
+                    adv_notional=adv_val, is_daily_bar=is_daily_bar,
+                )
+                fill = cb.fill_price
+                commission = cb.commission_paid
+                quantity = (invested - commission) / fill if fill > 0 else 0.0
                 if quantity <= 0:
                     continue
 
@@ -426,6 +488,7 @@ class PortfolioBacktestEngine:
                     "entry_time": t,
                     "invested": invested,
                     "bars_in_position": 0,
+                    "entry_cost_bps": cb.total_cost_bps,
                 }
                 cash -= invested
 
@@ -436,12 +499,21 @@ class PortfolioBacktestEngine:
             for pos in positions.values():
                 pos["bars_in_position"] += 1
 
-        # 6. Cerrar lo que quede al final del backtest.
+        # 6. Cerrar lo que quede al final del backtest con cost_model.
         for sym in list(positions.keys()):
             df = data[sym]
-            last_close = float(df["close"].iloc[-1]) * (1.0 - self._slip)
+            mid_last = float(df["close"].iloc[-1])
+            pos = positions[sym]
+            notional = pos["quantity"] * mid_last
+            adv_val = self._adv_at(adv_by_sym, sym, len(df) - 1)
+            cb = self.cost_model.apply(
+                mid=mid_last, side="SELL", notional=notional,
+                bar_time=df.index[-1] if isinstance(df.index[-1], pd.Timestamp) else None,
+                adv_notional=adv_val, is_daily_bar=is_daily_bar,
+            )
             proceeds = self._close(
-                positions[sym], last_close, df.index[-1], sym, trades, "END_OF_DATA"
+                pos, cb.fill_price, df.index[-1], sym, trades, "END_OF_DATA",
+                exit_cost_bps=cb.total_cost_bps,
             )
             cash += proceeds
             positions.pop(sym)
@@ -493,13 +565,26 @@ class PortfolioBacktestEngine:
         symbol: str,
         trades: List[dict],
         reason: str,
+        exit_cost_bps: Optional[float] = None,
     ) -> float:
-        """Cierra una posición long y registra el trade."""
+        """
+        Cierra una posición long y registra el trade.
+
+        `exit_price` ya incluye slippage si el cierre viene por SEÑAL o
+        END_OF_DATA (el motor lo pre-calcula con `cost_model.apply`). Para
+        cierres por SL/TP/MAX_HOLDING el `exit_price` es el trigger exacto
+        sin slippage extra. La comisión se aplica SIEMPRE en bps según el
+        cost model activo (`commission_rate()`).
+        """
         exit_value = pos["quantity"] * exit_price
-        commission = exit_value * self._comm
+        # I — Comisión unificada desde el cost_model (retro-compat: si es
+        # flat, coincide con self._comm).
+        commission = exit_value * self.cost_model.commission_rate()
         proceeds = exit_value - commission
         pnl = proceeds - pos["invested"]
         return_pct = (pnl / pos["invested"]) * 100 if pos["invested"] > 0 else 0.0
+        entry_bps = pos.get("entry_cost_bps", 0.0)
+        exit_bps = exit_cost_bps if exit_cost_bps is not None else 0.0
         trades.append({
             "symbol": symbol,
             "entry_price": pos["entry_price"],
@@ -511,8 +596,31 @@ class PortfolioBacktestEngine:
             "pnl": pnl,
             "return_pct": return_pct,
             "exit_reason": reason,
+            # I — Desglose de costes por trade (para auditoría / dashboard).
+            "entry_cost_bps": entry_bps,
+            "exit_cost_bps": exit_bps,
+            "total_cost_bps": entry_bps + exit_bps,
         })
         return proceeds
+
+    @staticmethod
+    def _adv_at(
+        adv_by_sym: Dict[str, pd.Series], sym: str, j: int
+    ) -> Optional[float]:
+        """
+        Lee el ADV ($ notional) del símbolo en la barra `j`.
+
+        Devuelve None si el ADV es NaN (warm-up) o si el índice está
+        fuera de rango; el cost model interpreta None como "no apliques
+        impact" (spread + commission sólo).
+        """
+        s = adv_by_sym.get(sym)
+        if s is None or j < 0 or j >= len(s):
+            return None
+        v = s.iloc[j]
+        if pd.isna(v):
+            return None
+        return float(v)
 
     # ──────────────────────────────────────────
     # Métricas agregadas + por símbolo
@@ -611,6 +719,11 @@ class PortfolioBacktestEngine:
             trades=trades,
             equity_curve=equity_curve,
             concurrent_positions_curve=concur_curve,
+            avg_cost_bps=round(
+                float(np.mean([t.get("total_cost_bps", 0.0) for t in trades]))
+                if trades else 0.0,
+                1,
+            ),
         )
 
     @staticmethod
