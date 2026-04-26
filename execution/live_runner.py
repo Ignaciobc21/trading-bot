@@ -85,6 +85,16 @@ class LiveConfig:
     # Opcional: filtro de horario de mercado (09:30-16:00 NY). Evita que el
     # bot intente operar con quotes rancios en horario cerrado.
     only_market_hours: bool = False
+    # ── K: Auto-retrain / drift detection ─────────────────────────
+    # Si `drift_monitor` no es None, el LiveRunner ejecutará un chequeo
+    # de drift cada `drift_check_every_iters` iteraciones (no en cada
+    # barra para no gastar CPU). Si el monitor dispara should_retrain,
+    # se llama a `retrain_orchestrator.trigger(...)`. Ambas piezas son
+    # opcionales — si no se pasan, el bucle es idéntico al histórico.
+    drift_check_every_iters: int = 20
+    # Path del pickle a vigilar con `ModelReloadWatcher` para hot-reload
+    # después de un retrain. Si None, no se hace hot-reload.
+    model_reload_path: Optional[str] = None
 
 
 @dataclass
@@ -224,6 +234,8 @@ class LiveRunner:
         risk_mgr=None,
         overlay=None,
         telegram_fn: Optional[Callable[[str], None]] = None,
+        drift_detector=None,
+        retrain_orchestrator=None,
     ):
         self.strategy = strategy
         self.config = config or LiveConfig()
@@ -232,6 +244,10 @@ class LiveRunner:
         self.risk = risk_mgr
         self.overlay = overlay
         self.telegram_fn = telegram_fn
+        # K: detector opcional de drift + orquestador opcional de retrain.
+        # Si alguno es None, su rama se salta (retro-compat).
+        self.drift_detector = drift_detector
+        self.retrain_orchestrator = retrain_orchestrator
 
         # Estado interno mínimo — el "source of truth" siguen siendo el
         # broker y la base de datos. Este cache es sólo para evitar
@@ -241,6 +257,15 @@ class LiveRunner:
         # Histórico de decisiones para el dashboard (deque circular limitado
         # por `state_history_size`). Se popula tras cada iteración.
         self._decision_history: List[Dict[str, Any]] = []
+        # K: último reporte de drift para el snapshot. Se refresca sólo
+        # en los iters en los que se ejecuta el chequeo.
+        self._last_drift_report: Optional[Dict[str, Any]] = None
+        # K: watcher de hot-reload del modelo (si el orchestrator lo
+        # reemplaza, el LiveRunner recarga la estrategia sin reiniciar).
+        self._reload_watcher = None
+        if self.config.model_reload_path:
+            from ml.retrain import ModelReloadWatcher
+            self._reload_watcher = ModelReloadWatcher(self.config.model_reload_path)
 
         # Validaciones básicas.
         if self.config.dry_run:
@@ -415,6 +440,12 @@ class LiveRunner:
         cfg = self.config
         self._iter_count += 1
 
+        # K: hot-reload del modelo si el orchestrator lo reemplazó.
+        # Se hace al principio del iter — así esta iter YA usa el modelo
+        # nuevo sin reiniciar el proceso.
+        if self._reload_watcher is not None and self._reload_watcher.check():
+            self._reload_strategy_inplace()
+
         # 1. Descargar histórico reciente.
         df = self._fetch_bars()
         if df is not None and not df.empty:
@@ -490,6 +521,18 @@ class LiveRunner:
             extras={"n_open_positions": len(self._open_positions_cache)},
         )
 
+        # K: chequeo de drift cada N iteraciones (no cada barra, es
+        # relativamente costoso: KS + PSI sobre decenas de features).
+        if (
+            self.drift_detector is not None
+            and self._iter_count > 0
+            and self._iter_count % max(self.config.drift_check_every_iters, 1) == 0
+        ):
+            try:
+                self._run_drift_check(df)
+            except Exception as exc:
+                logger.warning("Drift check falló: %s", exc)
+
         # Snapshot para el dashboard (H). Se escribe siempre que se haya
         # configurado `state_path`, sin importar si la iter cerró trade o no.
         if self.config.state_path:
@@ -500,6 +543,94 @@ class LiveRunner:
                 logger.warning("Snapshot dashboard falló: %s", exc)
 
         return decision
+
+    # ──────────────────────────────────────────
+    # K: Drift check + hot-reload del modelo
+    # ──────────────────────────────────────────
+    def _run_drift_check(self, df: pd.DataFrame) -> None:
+        """
+        Compara la distribución de las features recientes contra la de
+        referencia (training) y, si hay drift, llama al orchestrator.
+
+        El DataFrame `df` no trae features aún — las calculamos con el
+        mismo FeatureBuilder que usa la estrategia (si está disponible).
+        Si no, caemos a las columnas OHLCV puras (detecta cambios de
+        régimen de precio pero no de indicadores derivados).
+        """
+        if df is None or df.empty:
+            return
+
+        # Intentamos obtener las features ya calculadas. Las estrategias
+        # meta_* exponen `inferencer.feature_builder`.
+        fb = None
+        infer = getattr(self.strategy, "inferencer", None)
+        if infer is not None:
+            fb = getattr(infer, "feature_builder", None)
+
+        if fb is not None:
+            try:
+                features = fb.build(df, symbol=self.config.symbol)
+            except Exception as exc:
+                logger.debug("drift: FeatureBuilder falló (%s) — usando OHLCV.", exc)
+                features = df
+        else:
+            features = df
+
+        # Sólo columnas numéricas.
+        features = features.select_dtypes(include=[float, int])
+        if features.empty:
+            return
+
+        report = self.drift_detector.check(features)
+        self._last_drift_report = report.to_dict()
+        logger.info(
+            "Drift check #%d — KS %.0f%% PSI %.0f%% AUC=%s should_retrain=%s (%s)",
+            self._iter_count,
+            report.ks_feature_frac * 100,
+            report.psi_feature_frac * 100,
+            f"{report.auc_rolling:.3f}" if report.auc_rolling is not None else "n/a",
+            report.should_retrain,
+            report.reason,
+        )
+
+        if report.should_retrain and self.retrain_orchestrator is not None:
+            started = self.retrain_orchestrator.trigger(reason=report.reason)
+            if started:
+                self._notify(f"[trading-bot] RETRAIN lanzado — motivo: {report.reason}")
+
+    def _reload_strategy_inplace(self) -> None:
+        """
+        Recarga el modelo del meta-labeler sin reconstruir la estrategia
+        entera. Se invoca cuando el `ModelReloadWatcher` detecta un
+        swap del pickle.
+
+        Usa el mismo loader que el cold-start del main.py para garantizar
+        que la semántica es idéntica (global vs regime-split, sentiment,
+        threshold, feature_cols).
+        """
+        path = self.config.model_reload_path
+        if not path:
+            return
+        logger.info("Hot-reload: detecto cambio de %s, recargando estrategia.", path)
+        try:
+            # Import local para evitar ciclos. Reutilizamos el builder
+            # del main.py — garantiza que hot-reload y cold-start usan
+            # el mismo path de construcción (regime-split, sentiment,
+            # threshold, feature_cols).
+            from strategies.meta_labeled_ensemble import (
+                build_meta_labeled_ensemble_from_file,
+            )
+            new_strategy = build_meta_labeled_ensemble_from_file(path)
+            self.strategy = new_strategy
+            # Reiniciamos el contador de AUC bajo floor — damos al nuevo
+            # modelo el beneficio de la duda hasta tener histórico propio.
+            if self.drift_detector is not None:
+                self.drift_detector.reset_auc_counter()
+            logger.info("Hot-reload OK — estrategia ahora usa %s.", path)
+        except Exception as exc:
+            logger.exception(
+                "Hot-reload falló (%s). Bot sigue con el modelo anterior.", exc
+            )
 
     # ──────────────────────────────────────────
     def _write_state_snapshot(self, decision: LiveDecision, df: pd.DataFrame) -> None:
@@ -577,6 +708,17 @@ class LiveRunner:
             "model": model_info,
             "sentiment_spot": sent_info,
             "history": self._decision_history,
+            # K: snapshot del último chequeo de drift para el dashboard.
+            # Puede ser None si el monitor no está configurado o aún
+            # no ha corrido por primera vez.
+            "drift": self._last_drift_report,
+            # K: si el orchestrator está enchufado, exponemos su estado
+            # persistente (retrain_count, last_retrain_at, etc.) para
+            # que el dashboard muestre cuándo fue el último retrain.
+            "retrain_state": (
+                dict(self.retrain_orchestrator.state.data)
+                if self.retrain_orchestrator is not None else None
+            ),
         }
 
         path = Path(cfg.state_path).expanduser()

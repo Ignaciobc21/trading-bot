@@ -605,6 +605,95 @@ def run_train(
 # ═══════════════════════════════════════════════
 #  MODO LIVE
 # ═══════════════════════════════════════════════
+# K — Helpers para auto-retrain y drift reference
+# ═══════════════════════════════════════════════
+def _load_drift_reference(
+    model_path: str, symbol: str, strategy
+) -> Optional["pd.DataFrame"]:
+    """
+    Intenta obtener la distribución de features de referencia para el
+    detector de drift.
+
+    Orden de preferencia:
+      1. Si el pickle trae `X_reference_sample` (versión futura), usarlo.
+      2. Fallback: bajar 2 años de datos del símbolo y reconstruir
+         features con el mismo FeatureBuilder que la estrategia.
+
+    Devuelve un DataFrame de features o None si todo falla.
+    """
+    try:
+        import joblib
+        payload = joblib.load(model_path)
+        ref = payload.get("X_reference_sample") if isinstance(payload, dict) else None
+        if ref is not None and hasattr(ref, "columns"):
+            logger.info("Drift reference tomada del pickle (%d filas).", len(ref))
+            return ref
+    except Exception as exc:
+        logger.debug("No pude leer X_reference_sample del pickle: %s", exc)
+
+    # Fallback: reconstruir con el FeatureBuilder de la estrategia.
+    try:
+        from data.fetcher import DataFetcher
+        df = DataFetcher.fetch_yahoo(ticker=symbol, period="2y", interval="1d")
+        if df is None or df.empty:
+            return None
+        df.attrs["symbol"] = symbol
+        infer = getattr(strategy, "inferencer", None)
+        fb = getattr(infer, "feature_builder", None) if infer is not None else None
+        if fb is None:
+            from features import FeatureBuilder
+            fb = FeatureBuilder()
+        feats = fb.build(df, symbol=symbol)
+        feats = feats.select_dtypes(include=[float, int])
+        logger.info(
+            "Drift reference reconstruida vía yfinance (%d filas, %d features).",
+            len(feats), feats.shape[1],
+        )
+        return feats
+    except Exception as exc:
+        logger.warning("Fallback drift reference falló: %s", exc)
+        return None
+
+
+def _retrain_fn_for_orchestrator(**kwargs) -> dict:
+    """
+    Wrapper del pipeline de retrain para el `RetrainOrchestrator`.
+
+    El orchestrator le pasa `out_path`, `symbol`, `interval`, `symbols`,
+    `regime_split`, `threshold_objective`, `cv_method`,
+    `include_sentiment`, `period`. Internamente reutilizamos
+    `run_train` (single path con todas las capas) y al terminar cargamos
+    el pickle para devolver el dict de fold_metrics al orchestrator
+    (que calcula la AUC media para la decisión de promote).
+    """
+    import joblib
+    # `run_train` escribe el pickle y no devuelve el result en memoria,
+    # así que lo releemos desde disco. Es barato (KB).
+    out_path = kwargs.pop("out_path")
+    period = kwargs.pop("period", "5y")
+    symbols = kwargs.pop("symbols", None)
+
+    # run_train acepta exactamente estos args (ver firma arriba).
+    run_train(
+        symbol=kwargs.get("symbol", TRADING_SYMBOL),
+        period=period,
+        interval=kwargs.get("interval", "1d"),
+        out_path=out_path,
+        tp_mult=2.0,
+        sl_mult=1.5,
+        max_bars=10,
+        symbols=symbols,
+        regime_split=kwargs.get("regime_split", False),
+        threshold_objective=kwargs.get("threshold_objective", "sharpe"),
+        cv_method=kwargs.get("cv_method", "walk_forward"),
+        include_sentiment=kwargs.get("include_sentiment", False),
+    )
+    # Releer el pickle para devolver fold_metrics al orchestrator.
+    payload = joblib.load(out_path)
+    return payload
+
+
+# ═══════════════════════════════════════════════
 def run_live(
     symbol: str = TRADING_SYMBOL,
     timeframe: str = TIMEFRAME,
@@ -623,6 +712,15 @@ def run_live(
     max_iters: Optional[int] = None,
     sleep_seconds: Optional[int] = None,
     state_path: Optional[str] = None,
+    # ── K: Auto-retrain / drift detection ─────────────────────────
+    auto_retrain: bool = False,
+    retrain_cooldown_days: float = 7.0,
+    retrain_period: str = "5y",
+    retrain_symbols: Optional[list] = None,
+    drift_psi_strong: float = 0.25,
+    drift_auc_floor: float = 0.52,
+    drift_check_every_iters: int = 20,
+    drift_require_multi: bool = True,
 ) -> None:
     """
     Ejecuta el bot en modo live o paper trading.
@@ -745,7 +843,77 @@ def run_live(
         sleep_seconds=sleep_seconds,
         yahoo_interval=yahoo_interval,
         state_path=state_path,
+        drift_check_every_iters=drift_check_every_iters,
+        # Si auto_retrain está activo, el LiveRunner también debe
+        # vigilar el pickle para hot-reload tras un swap.
+        model_reload_path=model_path if auto_retrain and model_path else None,
     )
+
+    # ── K: Drift detector + retrain orchestrator ───────────────────────
+    drift_detector = None
+    retrain_orchestrator = None
+    if auto_retrain:
+        if not model_path:
+            logger.error("--auto-retrain requiere --model.")
+            sys.exit(1)
+        if strategy_name != "meta_ensemble":
+            logger.warning(
+                "--auto-retrain sólo tiene sentido con strategy=meta_ensemble. "
+                "Con otra estrategia, el monitor queda desactivado."
+            )
+        else:
+            from ml.drift import DriftConfig, DriftDetector
+            from ml.retrain import RetrainConfig, RetrainOrchestrator
+
+            drift_detector = DriftDetector(DriftConfig(
+                psi_strong=drift_psi_strong,
+                auc_floor=drift_auc_floor,
+                require_multiple_signals=drift_require_multi,
+            ))
+            # Reference = features del training. Las obtenemos desde el
+            # pickle: guardamos X_reference_sample al entrenar, y si no
+            # existe, caemos a un redownload rápido (puede fallar si no
+            # hay conexión — en ese caso desactivamos el detector).
+            ref_df = _load_drift_reference(
+                model_path, symbol, strategy
+            )
+            if ref_df is not None and not ref_df.empty:
+                drift_detector.fit_reference(ref_df)
+            else:
+                logger.warning(
+                    "No pude cargar la referencia de drift; deshabilito el monitor."
+                )
+                drift_detector = None
+
+            # Orchestrator: usa el mismo run_train que el modo CLI 'train'.
+            # train_args replica los flags clave del entreno original.
+            train_args = {
+                "symbol": symbol,
+                "interval": cfg.yahoo_interval if data_source == "yahoo" else "1d",
+                "symbols": retrain_symbols or None,
+                "regime_split": bool(retrain_symbols),
+                "threshold_objective": "sharpe",
+                "cv_method": "walk_forward",
+                "include_sentiment": False,
+            }
+            retrain_orchestrator = RetrainOrchestrator(
+                model_path=model_path,
+                retrain_fn=_retrain_fn_for_orchestrator,
+                config=RetrainConfig(
+                    cooldown_days=retrain_cooldown_days,
+                    retrain_period=retrain_period,
+                    retrain_symbols=retrain_symbols or [],
+                    train_args=train_args,
+                    backup_old_pickle=True,
+                    wait_result=False,
+                    min_auc_to_promote=drift_auc_floor,
+                ),
+            )
+            logger.info(
+                "K — AUTO-RETRAIN ACTIVO (cooldown %.1fd, PSI>%.2f, AUC<%.2f, check cada %d iters)",
+                retrain_cooldown_days, drift_psi_strong, drift_auc_floor,
+                drift_check_every_iters,
+            )
 
     runner = LiveRunner(
         strategy=strategy,
@@ -755,6 +923,8 @@ def run_live(
         risk_mgr=risk_mgr,
         overlay=overlay,
         telegram_fn=telegram_fn,
+        drift_detector=drift_detector,
+        retrain_orchestrator=retrain_orchestrator,
     )
 
     if telegram_fn and not dry_run:
@@ -962,6 +1132,31 @@ def main() -> None:
     parser.add_argument("--state-path", default=None,
                         help="H: path de un JSON donde el LiveRunner escribe un snapshot tras cada "
                              "iteración para que el dashboard pueda monitorizarlo en vivo.")
+    # ── K: Auto-retrain / drift detection ──
+    parser.add_argument("--auto-retrain", action="store_true",
+                        help="K: activa el monitor de drift y el reentreno automático. "
+                             "Requiere --model y strategy=meta_ensemble. Opt-in (default off).")
+    parser.add_argument("--retrain-cooldown-days", type=float, default=7.0,
+                        help="K: días mínimos entre reentrenos automáticos (default 7). "
+                             "Evita thrashing ante variaciones estadísticas temporales.")
+    parser.add_argument("--retrain-period", default="5y",
+                        help="K: período Yahoo a usar para el retrain automático (default 5y).")
+    parser.add_argument("--retrain-symbols", default=None,
+                        help="K: basket de símbolos (separado por comas) para el retrain "
+                             "automático. Si se omite, se reentrena sobre el --symbol del live.")
+    parser.add_argument("--drift-psi-strong", type=float, default=0.25,
+                        help="K: threshold PSI para considerar 'drift fuerte' por feature "
+                             "(default 0.25 — estándar industria).")
+    parser.add_argument("--drift-auc-floor", type=float, default=0.52,
+                        help="K: AUC rolling mínima aceptable del modelo en producción "
+                             "(default 0.52). Bajo esto se considera que el modelo perdió edge.")
+    parser.add_argument("--drift-check-every-iters", type=int, default=20,
+                        help="K: cada cuántos iters del live ejecutar el chequeo de drift "
+                             "(default 20). Evita el coste de KS+PSI en cada barra.")
+    parser.add_argument("--drift-single-signal", action="store_true",
+                        help="K: si se pasa, BASTA con una sola señal (KS, PSI o AUC) para "
+                             "disparar el retrain. Por defecto se requieren al menos 2 — más "
+                             "conservador, menos falsos positivos.")
     parser.add_argument("--save-result", default=None,
                         help="H: path para persistir el resultado del backtest/portfolio (pickle). "
                              "Útil para revisarlo después en el dashboard.")
@@ -1138,6 +1333,17 @@ def main() -> None:
             max_iters=args.live_max_iters,
             sleep_seconds=args.live_sleep,
             state_path=args.state_path,
+            auto_retrain=args.auto_retrain,
+            retrain_cooldown_days=args.retrain_cooldown_days,
+            retrain_period=args.retrain_period,
+            retrain_symbols=(
+                [s.strip().upper() for s in args.retrain_symbols.split(",") if s.strip()]
+                if args.retrain_symbols else None
+            ),
+            drift_psi_strong=args.drift_psi_strong,
+            drift_auc_floor=args.drift_auc_floor,
+            drift_check_every_iters=args.drift_check_every_iters,
+            drift_require_multi=(not args.drift_single_signal),
         )
 
 
