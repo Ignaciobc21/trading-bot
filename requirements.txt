@@ -30,6 +30,12 @@ joblib>=1.3.0
 # en las columnas de noticias y LightGBM lo maneja sin romperse.
 vaderSentiment>=3.3.2
 
+# ─── Hyperparameter tuning (J) ─────────────
+# Optuna se usa sólo cuando --mode train --tune-hp está activo. Si no lo
+# instalas, todo el resto del bot funciona igual; sólo el flag --tune-hp
+# lanza ImportError con instrucciones claras.
+optuna>=3.5.0
+
 # ─── Dashboard (H) ─────────────────────────
 # Streamlit sirve el panel y plotly hace los charts interactivos.
 # Se invoca con `python main.py --mode dashboard`. Si no necesitas

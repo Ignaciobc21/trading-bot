@@ -464,6 +464,9 @@ def run_train(
     cv_method: str = "walk_forward",
     purge_bars: Optional[int] = None,
     include_sentiment: bool = False,
+    tune_hp: bool = False,
+    tune_trials: int = 50,
+    tune_timeout: Optional[int] = None,
 ) -> None:
     """Entrena un MetaLabeler LightGBM sobre señales del ensemble y persiste.
 
@@ -472,6 +475,12 @@ def run_train(
       - basket (P4.1)             → `symbols` + no split
       - basket + regime-split (P4.2) → `symbols` + regime_split=True:
           entrena DOS modelos (trend-follow / mean-revert) en un único payload.
+
+    Fase J (hyperparameter tuning):
+      - `tune_hp=True` activa un sweep Optuna antes del fit final. Usa
+        `tune_trials` combinaciones y `tune_timeout` como techo opcional.
+      - Con regime_split, cada modelo (trend / mean_revert) se tunea por
+        separado.
     """
     from data.fetcher import DataFetcher
     from features import FeatureBuilder
@@ -509,6 +518,23 @@ def run_train(
     fb = FeatureBuilder(include_sentiment=include_sentiment)
     trainer = MetaLabelerTrainer(config=cfg, feature_builder=fb)
 
+    # J — Tuning opcional de hiperparámetros con Optuna.
+    # Si tune_hp es False, tune_config = None y el flujo es 100% igual
+    # que antes (defaults del MetaLabelerConfig.lgb_params).
+    tune_config = None
+    if tune_hp:
+        from ml.tuning import OptunaTunerConfig
+        tune_config = OptunaTunerConfig(
+            n_trials=tune_trials,
+            timeout=tune_timeout,
+            objective="auc",
+        )
+        logger.info(
+            "J — Optuna tuning ACTIVADO: n_trials=%d%s",
+            tune_trials,
+            f", timeout={tune_timeout}s" if tune_timeout else "",
+        )
+
     if symbols:
         dfs = {}
         for sym in symbols:
@@ -522,14 +548,18 @@ def run_train(
         if not dfs:
             logger.error("Ningún símbolo del basket produjo datos.")
             sys.exit(1)
-        result = trainer.train_multi_regime_split(dfs) if regime_split else trainer.train_multi(dfs)
+        result = (
+            trainer.train_multi_regime_split(dfs, tune_config=tune_config)
+            if regime_split
+            else trainer.train_multi(dfs, tune_config=tune_config)
+        )
     else:
         df = DataFetcher.fetch_yahoo(ticker=symbol, period=period, interval=interval)
         if df.empty:
             logger.error("No se pudieron obtener datos para %s", symbol)
             sys.exit(1)
         logger.info("Datos: %d filas [%s → %s]", len(df), df.index[0], df.index[-1])
-        result = trainer.train(df, symbol=symbol)
+        result = trainer.train(df, symbol=symbol, tune_config=tune_config)
 
     if result.get("kind") == "regime_split":
         # Reporting específico para el payload per-régimen.
@@ -882,6 +912,19 @@ def main() -> None:
     parser.add_argument("--purge-bars", type=int, default=None,
                         help="F: barras a purgar antes de cada test fold en --cv-method purged_kfold "
                              "(default: igual a --train-max-bars, el horizonte del triple-barrier).")
+    # ── J: Hyperparameter tuning (Optuna) ──
+    parser.add_argument("--tune-hp", action="store_true",
+                        help="J: activa el sweep Optuna sobre los hiperparámetros de LightGBM "
+                             "antes del entrenamiento final. Usa TPE sampler + MedianPruner. "
+                             "Con --regime-split, tunea cada régimen por separado. Sin esta "
+                             "flag, se usan los defaults conservadores de MetaLabelerConfig.")
+    parser.add_argument("--tune-trials", type=int, default=50,
+                        help="J: número de combinaciones a probar en el sweep Optuna. "
+                             "Mínimo útil 30; sweet spot 50-100 (default: 50).")
+    parser.add_argument("--tune-timeout", type=int, default=None,
+                        help="J: techo en segundos para el sweep Optuna completo (default: "
+                             "None = sin límite). Útil para acotar entrenamientos largos: "
+                             "gana el primero que se alcance entre --tune-trials y --tune-timeout.")
     # ── B: Sentiment ──
     parser.add_argument("--include-sentiment", action="store_true",
                         help="B: añade features de sentimiento al pipeline (VADER sobre yfinance "
@@ -1000,6 +1043,9 @@ def main() -> None:
             cv_method=args.cv_method,
             purge_bars=args.purge_bars,
             include_sentiment=args.include_sentiment,
+            tune_hp=args.tune_hp,
+            tune_trials=args.tune_trials,
+            tune_timeout=args.tune_timeout,
         )
     elif args.mode == "features":
         period = args.period
