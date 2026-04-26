@@ -56,7 +56,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    # Type-only import para evitar ciclo import: tuning.py importa
+    # MetaLabelerTrainer para el type hint, y meta_labeler.py importa
+    # OptunaTunerConfig aquí para el hint de firma. En runtime lo
+    # importamos perezosamente dentro de _maybe_tune.
+    from ml.tuning import OptunaTunerConfig
 
 import joblib
 import lightgbm as lgb
@@ -430,6 +437,7 @@ class MetaLabelerTrainer:
         X: pd.DataFrame,
         y: pd.Series,
         ret: Optional[pd.Series] = None,
+        lgb_params_override: Optional[dict] = None,
     ) -> dict:
         """
         Entrena con cross-validation según `self.config.cv_method`
@@ -445,6 +453,11 @@ class MetaLabelerTrainer:
             ret  : retornos realizados por trade (alineados con X). Si se
                    facilita, habilita la selección de threshold por Sharpe
                    (threshold_objective="sharpe"). Si es None, se cae a F1.
+            lgb_params_override : si no es None, sobrescribe
+                   `self.config.lgb_params` para este entrenamiento. Lo usa
+                   la fase J (Optuna tuning) para inyectar los best_params
+                   resultantes del sweep. NO modifica el config in-place —
+                   sólo reemplaza los params en los modelos de este fit.
 
         Devuelve: dict con el modelo final (re-entrenado sobre TODO el
         histórico), feature_cols, threshold elegido, métricas por fold,
@@ -460,6 +473,9 @@ class MetaLabelerTrainer:
         fold_metrics = []
         objective = self.config.threshold_objective
         cv_method = self.config.cv_method
+        # J: si el tuner nos pasa best_params, usamos esos. Si no,
+        # caemos a los defaults conservadores del config.
+        lgb_params = lgb_params_override if lgb_params_override is not None else self.config.lgb_params
 
         for train_idx, test_idx, fold_id in self._cv_splits(n):
             X_train = X.iloc[train_idx]
@@ -474,7 +490,7 @@ class MetaLabelerTrainer:
 
             i = fold_id  # alias usado por las métricas más abajo
 
-            model = lgb.LGBMClassifier(**self.config.lgb_params, random_state=self.config.random_state)
+            model = lgb.LGBMClassifier(**lgb_params, random_state=self.config.random_state)
             model.fit(X_train, y_train)
             proba = model.predict_proba(X_test)[:, 1]
             base_rate = float(y_test.mean()) if len(y_test) else float("nan")
@@ -525,7 +541,8 @@ class MetaLabelerTrainer:
 
         # Modelo final sobre todo el histórico. Usamos la MEDIANA de los
         # thresholds elegidos por fold — robusta a outliers en folds pequeños.
-        final_model = lgb.LGBMClassifier(**self.config.lgb_params, random_state=self.config.random_state)
+        # En J: lgb_params viene de Optuna si el usuario hizo --tune-hp.
+        final_model = lgb.LGBMClassifier(**lgb_params, random_state=self.config.random_state)
         final_model.fit(X, y)
         threshold = float(np.median([m["threshold"] for m in fold_metrics])) if fold_metrics else 0.5
         importances = dict(
@@ -543,6 +560,9 @@ class MetaLabelerTrainer:
             "cv_method": cv_method,
             "fold_metrics": fold_metrics,
             "feature_importance": importances,
+            # J: guardamos los lgb_params efectivos en el resultado para
+            # poder auditar qué hiperparámetros se usaron en este modelo.
+            "lgb_params_used": dict(lgb_params),
         }
 
     # ──────────────────────────────────────────
@@ -553,21 +573,61 @@ class MetaLabelerTrainer:
             return None
         return meta_df.loc[index, "ret"].astype(float)
 
-    def train(self, df: pd.DataFrame, symbol: Optional[str] = None) -> dict:
+    # ──────────────────────────────────────────
+    # J — Hyperparameter tuning con Optuna
+    # ──────────────────────────────────────────
+    def _maybe_tune(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        tune_config: Optional["OptunaTunerConfig"] = None,
+    ) -> Tuple[Optional[dict], Optional[dict]]:
+        """
+        Si `tune_config` es not-None, corre un sweep Optuna y devuelve
+        (best_params, study_summary). Si es None, devuelve (None, None)
+        y `walk_forward_fit` caerá a los defaults del config.
+
+        Separado en método privado para que tanto `train` como `train_multi`
+        y `train_multi_regime_split` puedan llamarlo sin duplicar lógica.
+        """
+        if tune_config is None:
+            return None, None
+        # Import diferido — sólo carga optuna si realmente hacemos tuning.
+        from ml.tuning import OptunaTuner, summarize_study
+        tuner = OptunaTuner(self, tune_config)
+        best_params, study = tuner.tune(X, y)
+        return best_params, summarize_study(study)
+
+    def train(
+        self,
+        df: pd.DataFrame,
+        symbol: Optional[str] = None,
+        tune_config: Optional["OptunaTunerConfig"] = None,
+    ) -> dict:
         X, y, meta_df = self.build_dataset(df, symbol=symbol)
         ret = self._extract_ret(meta_df, X.index)
-        result = self.walk_forward_fit(X, y, ret=ret)
+        # J: tuning opcional antes del fit final. Si tune_config es None,
+        # se salta y el comportamiento es idéntico a antes.
+        best_params, study_summary = self._maybe_tune(X, y, tune_config)
+        result = self.walk_forward_fit(X, y, ret=ret, lgb_params_override=best_params)
         result["config"] = asdict(self.config)
         result["n_samples"] = int(len(X))
         result["base_rate_global"] = float(y.mean()) if len(y) else float("nan")
         result["train_symbols"] = None
+        if study_summary is not None:
+            result["optuna_study"] = study_summary
         return result
 
-    def train_multi(self, dfs: Dict[str, pd.DataFrame]) -> dict:
+    def train_multi(
+        self,
+        dfs: Dict[str, pd.DataFrame],
+        tune_config: Optional["OptunaTunerConfig"] = None,
+    ) -> dict:
         """Entrena sobre un basket de símbolos. `dfs` = {symbol: ohlcv_df}."""
         X, y, meta_df = self.build_dataset_multi(dfs)
         ret = self._extract_ret(meta_df, X.index)
-        result = self.walk_forward_fit(X, y, ret=ret)
+        best_params, study_summary = self._maybe_tune(X, y, tune_config)
+        result = self.walk_forward_fit(X, y, ret=ret, lgb_params_override=best_params)
         result["config"] = asdict(self.config)
         result["n_samples"] = int(len(X))
         result["base_rate_global"] = float(y.mean()) if len(y) else float("nan")
@@ -576,11 +636,15 @@ class MetaLabelerTrainer:
             meta_df["symbol"].value_counts().to_dict()
             if "symbol" in meta_df.columns else {}
         )
+        if study_summary is not None:
+            result["optuna_study"] = study_summary
         return result
 
     # ──────────────────────────────────────────
     def train_multi_regime_split(
-        self, dfs: Dict[str, pd.DataFrame]
+        self,
+        dfs: Dict[str, pd.DataFrame],
+        tune_config: Optional["OptunaTunerConfig"] = None,
     ) -> dict:
         """
         Entrena DOS modelos LightGBM separados, uno por tipo de señal del
@@ -624,14 +688,27 @@ class MetaLabelerTrainer:
                 f"[regime-split] {regime_name}: {len(X_r)} muestras  "
                 f"base_rate={y_r.mean():.3f}"
             )
+            # J: cada régimen (trend vs mean_revert) se tunea por separado.
+            # Tiene sentido: los patrones que funcionan para tendencia no
+            # tienen por qué funcionar para mean-reversion, así que cada uno
+            # merece su propio espacio de hiperparámetros óptimo.
             try:
-                res = self.walk_forward_fit(X_r, y_r, ret=ret_r)
+                best_params_r, study_summary_r = self._maybe_tune(X_r, y_r, tune_config)
+            except Exception as exc:
+                print(f"[regime-split] {regime_name}: tuning falló ({exc}) — usa defaults")
+                best_params_r, study_summary_r = None, None
+            try:
+                res = self.walk_forward_fit(
+                    X_r, y_r, ret=ret_r, lgb_params_override=best_params_r
+                )
             except ValueError as exc:
                 print(f"[regime-split] {regime_name}: skip fit ({exc})")
                 continue
             res["config"] = asdict(self.config)
             res["n_samples"] = int(len(X_r))
             res["base_rate_global"] = float(y_r.mean()) if len(y_r) else float("nan")
+            if study_summary_r is not None:
+                res["optuna_study"] = study_summary_r
             per_regime[regime_name] = res
 
         if not per_regime:
