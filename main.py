@@ -111,10 +111,18 @@ def run_backtest(
     use_regime_sizing: bool = True,
     use_confidence_sizing: bool = True,
     save_result: Optional[str] = None,
+    cost_model_kind: str = "flat",
+    commission_bps: float = 1.0,
+    spread_bps: float = 4.0,
+    impact_coef: float = 0.1,
 ) -> None:
     """Descarga datos y ejecuta un backtest con la estrategia seleccionada."""
     from data.fetcher import DataFetcher
     from backtesting.engine import BacktestEngine
+    # I — Cost model configurable. Si kind='flat' usa los flags antiguos
+    # (commission_pct/slippage_pct) y mantiene compatibilidad bit-for-bit.
+    # Si 'realistic', construye un modelo con spread por hora + impact.
+    from execution.costs import build_cost_model
 
     logger.info("═" * 50)
     logger.info("  MODO BACKTEST — strategy=%s", strategy_name)
@@ -176,6 +184,22 @@ def run_backtest(
         )
 
     # 4. Ejecutar backtest
+    # I — Construir cost_model según flags del CLI.
+    cost_model = build_cost_model(
+        kind=cost_model_kind,
+        commission_pct=commission_pct,
+        slippage_pct=slippage_pct,
+        commission_bps=commission_bps,
+        spread_bps=spread_bps,
+        impact_coef=impact_coef,
+    )
+    logger.info(
+        "Cost model: %s (%s)",
+        cost_model.name,
+        f"comm_bps={commission_bps}, spread_bps={spread_bps}, impact_coef={impact_coef}"
+        if cost_model_kind == "realistic"
+        else f"commission_pct={commission_pct}, slippage_pct={slippage_pct}",
+    )
     engine = BacktestEngine(
         strategy=strategy,
         initial_capital=INITIAL_CAPITAL,
@@ -186,6 +210,7 @@ def run_backtest(
         take_profit_pct=take_profit_pct,
         max_holding_bars=max_holding_bars,
         max_daily_loss_pct=max_daily_loss_pct if risk_overlay else 0.0,
+        cost_model=cost_model,
     )
     result = engine.run(df, lookback=lookback, size_multiplier=size_multiplier)
 
@@ -249,6 +274,10 @@ def run_portfolio(
     corr_threshold: Optional[float] = 0.75,
     corr_window: int = 60,
     save_result: Optional[str] = None,
+    cost_model_kind: str = "flat",
+    commission_bps: float = 1.0,
+    spread_bps: float = 4.0,
+    impact_coef: float = 0.1,
 ) -> None:
     """
     G — Backtest multi-símbolo con capital compartido y correlation guard.
@@ -256,9 +285,14 @@ def run_portfolio(
     Reutiliza la misma `BaseStrategy` que el backtest single-symbol; la
     única diferencia es el motor: `PortfolioBacktestEngine` itera todos
     los símbolos en paralelo sobre un índice maestro común.
+
+    En la fase I se añadió soporte para cost_model: flat (retro-compat,
+    default) o realistic (spread por hora + market impact). El cost_model
+    se pasa al motor vía `PortfolioConfig.cost_model`.
     """
     from data.fetcher import DataFetcher
     from backtesting.portfolio_engine import PortfolioBacktestEngine, PortfolioConfig
+    from execution.costs import build_cost_model
 
     logger.info("═" * 50)
     logger.info("  MODO PORTFOLIO — strategy=%s  symbols=%s", strategy_name, ",".join(symbols))
@@ -289,6 +323,22 @@ def run_portfolio(
     )
 
     # 3. Motor de cartera.
+    # I — Construir cost_model antes de crear la config.
+    cost_model = build_cost_model(
+        kind=cost_model_kind,
+        commission_pct=commission_pct,
+        slippage_pct=slippage_pct,
+        commission_bps=commission_bps,
+        spread_bps=spread_bps,
+        impact_coef=impact_coef,
+    )
+    logger.info(
+        "Cost model: %s (%s)",
+        cost_model.name,
+        f"comm_bps={commission_bps}, spread_bps={spread_bps}, impact_coef={impact_coef}"
+        if cost_model_kind == "realistic"
+        else f"commission_pct={commission_pct}, slippage_pct={slippage_pct}",
+    )
     cfg = PortfolioConfig(
         initial_capital=INITIAL_CAPITAL,
         commission_pct=commission_pct,
@@ -301,6 +351,7 @@ def run_portfolio(
         # El usuario puede desactivar el guard pasando un threshold > 1.
         corr_threshold=corr_threshold if (corr_threshold is not None and corr_threshold <= 1.0) else None,
         corr_window=corr_window,
+        cost_model=cost_model,
     )
     engine = PortfolioBacktestEngine(strategy=strategy, config=cfg)
     # El motor ya llama a `logger.info(result.summary())` internamente.
@@ -764,9 +815,25 @@ def main() -> None:
     parser.add_argument("--take-profit-pct", type=float, default=0.0,
                         help="Take-profit en %% del precio de entrada (default: 0 = desactivado)")
     parser.add_argument("--slippage-pct", type=float, default=SLIPPAGE_PCT,
-                        help=f"Slippage aplicado en cada fill (default: {SLIPPAGE_PCT}%%)")
+                        help=f"Slippage aplicado en cada fill (default: {SLIPPAGE_PCT}%%). "
+                             f"Solo aplica al cost-model flat.")
     parser.add_argument("--commission-pct", type=float, default=COMMISSION_PCT,
-                        help=f"Comisión por operación (default: {COMMISSION_PCT}%%)")
+                        help=f"Comisión por operación (default: {COMMISSION_PCT}%%). "
+                             f"Solo aplica al cost-model flat.")
+    # ── I: Cost model realista (opt-in) ──
+    parser.add_argument("--cost-model", choices=["flat", "realistic"], default="flat",
+                        help="I: modelo de costes. 'flat' (default, retro-compat) usa comisión y "
+                             "slippage constantes. 'realistic' aplica spread variable por hora del "
+                             "día + market impact raíz-cuadrática (Almgren-Chriss) sobre el ADV 20d.")
+    parser.add_argument("--commission-bps", type=float, default=1.0,
+                        help="I: comisión en basis points para cost-model=realistic (default: 1.0 bp).")
+    parser.add_argument("--spread-bps", type=float, default=4.0,
+                        help="I: spread bid-ask base en bps para cost-model=realistic (default: 4.0). "
+                             "Se multiplica por el factor horario (apertura 1.5x, medio día 1.0x, etc.).")
+    parser.add_argument("--impact-coef", type=float, default=0.1,
+                        help="I: coeficiente `k` del market impact (default: 0.1). "
+                             "impact_bps = k * 10000 * sqrt(notional/ADV). "
+                             "Con k=0.1 y participation=1%% → ~10 bps.")
     parser.add_argument("--max-holding-bars", type=int, default=MAX_HOLDING_BARS,
                         help="Máximo de barras en posición (0 = ilimitado)")
     parser.add_argument("--trend-filter", action="store_true",
@@ -903,6 +970,10 @@ def main() -> None:
             use_regime_sizing=not args.no_regime_sizing,
             use_confidence_sizing=not args.no_confidence_sizing,
             save_result=args.save_result,
+            cost_model_kind=args.cost_model,
+            commission_bps=args.commission_bps,
+            spread_bps=args.spread_bps,
+            impact_coef=args.impact_coef,
         )
     elif args.mode == "train":
         if not args.model:
@@ -971,6 +1042,10 @@ def main() -> None:
             corr_threshold=args.corr_threshold,
             corr_window=args.corr_window,
             save_result=args.save_result,
+            cost_model_kind=args.cost_model,
+            commission_bps=args.commission_bps,
+            spread_bps=args.spread_bps,
+            impact_coef=args.impact_coef,
         )
     elif args.mode == "dashboard":
         # H — Lanza el dashboard Streamlit. El binario `streamlit` debe
