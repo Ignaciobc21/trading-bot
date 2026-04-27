@@ -714,6 +714,7 @@ def run_live(
     threshold_override: Optional[float] = None,
     dry_run: bool = False,
     data_source: str = "alpaca",
+    alpaca_feed: str = "iex",
     risk_overlay: bool = False,
     target_vol: float = 0.20,
     max_daily_loss_pct: float = 0.0,
@@ -847,6 +848,7 @@ def run_live(
         symbol=symbol,
         timeframe=timeframe,
         data_source=data_source,
+        alpaca_feed=alpaca_feed,
         dry_run=dry_run,
         base_position_size_pct=base_position_size_pct,
         stop_loss_pct=stop_loss_pct,
@@ -1176,6 +1178,8 @@ def main() -> None:
                         help=f"E — timeframe Alpaca-style para --mode live (default: {TIMEFRAME}). Valores: 1Min, 5Min, 15Min, 1Hour, 1Day.")
     g_live.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca",
                         help="E — origen de datos en --mode live. 'alpaca' (real-time, requiere creds en config/secrets.env) o 'yahoo' (delay 15-20m, gratis, sin creds).")
+    g_live.add_argument("--alpaca-feed", choices=["iex", "sip"], default="iex",
+                        help="E — feed Alpaca para equities (default: iex = único gratis). 'sip' (consolidated tape) requiere plan de pago. Ignorado para crypto.")
     g_live.add_argument("--dry-run", action="store_true",
                         help="E — --mode live no envía órdenes reales: solo loguea la decisión y simula fills (útil para validar señales sin riesgo).")
     g_live.add_argument("--live-position-size-pct", type=float, default=2.0,
@@ -1369,6 +1373,7 @@ def main() -> None:
             threshold_override=args.train_threshold,
             dry_run=args.dry_run,
             data_source=args.data_source,
+            alpaca_feed=args.alpaca_feed,
             risk_overlay=args.risk_overlay,
             target_vol=args.target_vol,
             max_daily_loss_pct=args.max_daily_loss_pct,
