@@ -16,6 +16,18 @@ import argparse
 import time
 import sys
 from pathlib import Path
+
+# ── Compatibilidad con consolas Windows (cp1252) ──
+# El help y los banners contienen caracteres Unicode (—, ─, ═, →, ≈, ≥) que
+# revientan en `cmd.exe` y `Git Bash` por defecto (codec cp1252).  Forzamos
+# UTF-8 en stdout/stderr — disponible en Python 3.7+; si la terminal no lo
+# soporta, hacemos fallback silencioso.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
 from typing import Dict, Optional
 
 import pandas as pd
@@ -1099,11 +1111,11 @@ def main() -> None:
                          help="I — modelo de costes. 'flat' (default, retro-compat) usa comisión y slippage constantes. "
                               "'realistic' aplica spread variable por hora + market impact raíz-cuadrática (Almgren-Chriss) sobre ADV 20d.")
     g_costs.add_argument("--commission-bps", type=float, default=1.0,
-                         help="I — comisión en basis points cuando --cost-model=realistic (default: 1.0 bp ≈ Alpaca/IBKR retail).")
+                         help="I — comisión en basis points cuando --cost-model=realistic (default: 1.0 bp, ~Alpaca/IBKR retail).")
     g_costs.add_argument("--spread-bps", type=float, default=4.0,
                          help="I — spread bid-ask base en bps (default: 4.0). Se multiplica por factor horario: apertura 1.5x, medio día 1.0x, cierre 1.3x.")
     g_costs.add_argument("--impact-coef", type=float, default=0.1,
-                         help="I — coeficiente `k` del market impact (default: 0.1). impact_bps = k·10000·sqrt(notional/ADV). Con k=0.1 y participation=1%% ≈ 10 bps.")
+                         help="I — coeficiente `k` del market impact (default: 0.1). impact_bps = k*10000*sqrt(notional/ADV). Con k=0.1 y participation=1%% da ~10 bps.")
 
     # ── features ────────────────────────────────────────────────────────
     g_features.add_argument("--features-out", default=None,
@@ -1157,7 +1169,7 @@ def main() -> None:
     g_risk.add_argument("--no-regime-sizing", action="store_true",
                         help="Desactiva el componente regime del risk overlay (CHOP=0.5x, MEAN_REVERT=0.7x).")
     g_risk.add_argument("--no-confidence-sizing", action="store_true",
-                        help="Desactiva el componente confidence del risk overlay (mapeo lineal proba → multiplicador).")
+                        help="Desactiva el componente confidence del risk overlay (mapeo lineal proba -> multiplicador).")
 
     # ── live / paper ────────────────────────────────────────────────────
     g_live.add_argument("--live-timeframe", default=TIMEFRAME,
@@ -1191,7 +1203,7 @@ def main() -> None:
     g_retrain.add_argument("--drift-check-every-iters", type=int, default=20,
                            help="K — cada cuántos iters ejecutar el chequeo de drift (default: 20). Evita coste KS+PSI en cada barra.")
     g_retrain.add_argument("--drift-single-signal", action="store_true",
-                           help="K — si se pasa, basta con UNA señal (KS, PSI o AUC) para disparar retrain. Por defecto se requieren ≥2 — más conservador.")
+                           help="K — si se pasa, basta con UNA señal (KS, PSI o AUC) para disparar retrain. Por defecto se requieren >=2 — más conservador.")
 
     # ── dashboard (H) ───────────────────────────────────────────────────
     g_dashboard.add_argument("--save-result", default=None,
