@@ -33,8 +33,16 @@ def send_telegram_message(
     Returns:
         True si el mensaje se envió correctamente.
     """
-    if not token or not chat_id:
-        logger.warning("Telegram no configurado — mensaje no enviado")
+    # Detectamos token/chat_id ausentes o placeholders obvios del .env de ejemplo.
+    # Sin esto, el código trataría "tu_telegram_token_aqui" como válido e intentaría
+    # hacer POST contra la URL del bot, generando 404s que ensucian los logs.
+    placeholders = ("tu_", "your_", "aqui", "here", "xxx", "todo", "placeholder")
+    def _is_placeholder(val: str) -> bool:
+        low = (val or "").strip().lower()
+        return not low or any(p in low for p in placeholders)
+
+    if _is_placeholder(token) or _is_placeholder(chat_id):
+        logger.debug("Telegram no configurado — mensaje silencioso")
         return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"

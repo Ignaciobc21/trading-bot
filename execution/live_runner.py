@@ -75,6 +75,9 @@ class LiveConfig:
     data_source: str = "alpaca"
     yahoo_period: str = "6mo"            # Sólo si data_source="yahoo".
     yahoo_interval: str = "1h"
+    # Feed Alpaca para equities (ignorado en crypto). "iex" es el único gratis;
+    # "sip" (consolidated tape) requiere plan de pago.
+    alpaca_feed: str = "iex"
     # Notificaciones Telegram.
     send_telegram: bool = True
     # Dashboard (H): si se especifica, el runner escribe un snapshot
@@ -113,7 +116,7 @@ class LiveDecision:
 # ──────────────────────────────────────────────
 # Data source helpers
 # ──────────────────────────────────────────────
-def _fetch_bars_alpaca(api, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+def _fetch_bars_alpaca(api, symbol: str, timeframe: str, limit: int, feed: str = "iex") -> pd.DataFrame:
     """
     Descarga las últimas `limit` barras desde Alpaca.
 
@@ -144,8 +147,11 @@ def _fetch_bars_alpaca(api, symbol: str, timeframe: str, limit: int) -> pd.DataF
     else:
         start = end - timedelta(days=max(365, limit * 2))
 
+    # feed="iex" es el único feed gratis de Alpaca para equities. "sip" (consolidated
+    # tape NYSE/NASDAQ) requiere suscripción de pago. Para crypto el parámetro se
+    # ignora silenciosamente por el SDK.
     bars = api.get_bars(
-        symbol, tf, start=start.isoformat(), end=end.isoformat()
+        symbol, tf, start=start.isoformat(), end=end.isoformat(), feed=feed,
     ).df
     if bars.empty:
         return bars
@@ -290,7 +296,8 @@ class LiveRunner:
             if self.broker is None or getattr(self.broker, "api", None) is None:
                 raise RuntimeError("data_source=alpaca requiere un Broker inicializado.")
             return _fetch_bars_alpaca(
-                self.broker.api, cfg.symbol, cfg.timeframe, cfg.history_bars
+                self.broker.api, cfg.symbol, cfg.timeframe, cfg.history_bars,
+                feed=cfg.alpaca_feed,
             )
         if cfg.data_source == "yahoo":
             return _fetch_bars_yahoo(
