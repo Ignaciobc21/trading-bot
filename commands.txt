@@ -35,3 +35,68 @@ python main.py --mode dashboard \
   --state-path /tmp/live.json \
   --save-result /tmp/portfolio.pkl \
   --model models/basket25_split_sent.pkl
+
+# --------------------------------------------
+#  PARTE 1 — LLAMADAS DE BACKTEST (P1)
+# --------------------------------------------
+
+# Ejemplo: Backtest single-symbol con risk overlay y realistic cost
+python main.py --mode backtest --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl --symbol NFLX \
+  --period 5y --risk-overlay --target-vol 0.20 \
+  --cost-model realistic --save-result /tmp/nflx_bt.pkl
+
+# Ejemplo: Multi-symbol portfolio con correlation guard y optimized cost
+python main.py --mode portfolio --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols NFLX,DIS,KO,BTC-USD,INTC,PFE,NKE \
+  --max-positions 4 --corr-threshold 0.75 \
+  --cost-model realistic --commission-bps 1 --spread-bps 4 \
+  --save-result /tmp/portfolio.pkl
+
+
+# --------------------------------------------
+#  PARTE 2 — LLAMADAS DE ENTRENAMIENTO (P3)
+# --------------------------------------------
+
+# Ejemplo: Train completo con regime split, purged k-fold, sentiment y Optuna tuning
+python main.py --mode train \
+  --symbols SPY,QQQ,IWM,AAPL,MSFT,NVDA,GOOGL,META,AMZN,TSLA,JPM,BAC,GS,WMT,COST \
+  --period 5y --regime-split --threshold-objective sharpe \
+  --cv-method purged_kfold --include-sentiment \
+  --tune-hp --tune-trials 50 --model models/v2.pkl
+
+
+# --------------------------------------------
+#  PARTE 3 — LLAMADAS DE LIVE/PAPER (P5)
+# --------------------------------------------
+
+# Ejemplo: Paper / dry-run live con risk overlay y auto-retrain
+python main.py --mode live --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl --symbol AAPL \
+  --live-timeframe 1Day --data-source yahoo --dry-run \
+  --risk-overlay --target-vol 0.20 --max-daily-loss-pct 5 \
+  --auto-retrain --retrain-cooldown-days 7 \
+  --drift-check-every-iters 20 --state-path /tmp/live.json
+
+
+# --------------------------------------------
+#  PARTE 4 — LLAMADAS DE DASHBOARD (P7)
+# --------------------------------------------
+
+# Ejemplo: Dashboard con todos los enlaces
+python main.py --mode dashboard \
+  --state-path /tmp/live.json --save-result /tmp/portfolio.pkl \
+  --model models/basket25_split_sent.p
+
+
+
+
+
+# --------------------------------------------
+#  COMANDOS PARA RECIBIR INFORMACION DEL BOT 
+# --------------------------------------------
+
+python main.py --help            # vista completa con grupos
+python main.py --help | less     # navegable con teclado
+python main.py --help | grep -A2 "drift"   # buscar un flag concreto
