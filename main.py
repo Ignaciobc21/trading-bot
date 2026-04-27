@@ -16,6 +16,18 @@ import argparse
 import time
 import sys
 from pathlib import Path
+
+# ── Compatibilidad con consolas Windows (cp1252) ──
+# El help y los banners contienen caracteres Unicode (—, ─, ═, →, ≈, ≥) que
+# revientan en `cmd.exe` y `Git Bash` por defecto (codec cp1252).  Forzamos
+# UTF-8 en stdout/stderr — disponible en Python 3.7+; si la terminal no lo
+# soporta, hacemos fallback silencioso.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
 from typing import Dict, Optional
 
 import pandas as pd
@@ -605,6 +617,95 @@ def run_train(
 # ═══════════════════════════════════════════════
 #  MODO LIVE
 # ═══════════════════════════════════════════════
+# K — Helpers para auto-retrain y drift reference
+# ═══════════════════════════════════════════════
+def _load_drift_reference(
+    model_path: str, symbol: str, strategy
+) -> Optional["pd.DataFrame"]:
+    """
+    Intenta obtener la distribución de features de referencia para el
+    detector de drift.
+
+    Orden de preferencia:
+      1. Si el pickle trae `X_reference_sample` (versión futura), usarlo.
+      2. Fallback: bajar 2 años de datos del símbolo y reconstruir
+         features con el mismo FeatureBuilder que la estrategia.
+
+    Devuelve un DataFrame de features o None si todo falla.
+    """
+    try:
+        import joblib
+        payload = joblib.load(model_path)
+        ref = payload.get("X_reference_sample") if isinstance(payload, dict) else None
+        if ref is not None and hasattr(ref, "columns"):
+            logger.info("Drift reference tomada del pickle (%d filas).", len(ref))
+            return ref
+    except Exception as exc:
+        logger.debug("No pude leer X_reference_sample del pickle: %s", exc)
+
+    # Fallback: reconstruir con el FeatureBuilder de la estrategia.
+    try:
+        from data.fetcher import DataFetcher
+        df = DataFetcher.fetch_yahoo(ticker=symbol, period="2y", interval="1d")
+        if df is None or df.empty:
+            return None
+        df.attrs["symbol"] = symbol
+        infer = getattr(strategy, "inferencer", None)
+        fb = getattr(infer, "feature_builder", None) if infer is not None else None
+        if fb is None:
+            from features import FeatureBuilder
+            fb = FeatureBuilder()
+        feats = fb.build(df, symbol=symbol)
+        feats = feats.select_dtypes(include=[float, int])
+        logger.info(
+            "Drift reference reconstruida vía yfinance (%d filas, %d features).",
+            len(feats), feats.shape[1],
+        )
+        return feats
+    except Exception as exc:
+        logger.warning("Fallback drift reference falló: %s", exc)
+        return None
+
+
+def _retrain_fn_for_orchestrator(**kwargs) -> dict:
+    """
+    Wrapper del pipeline de retrain para el `RetrainOrchestrator`.
+
+    El orchestrator le pasa `out_path`, `symbol`, `interval`, `symbols`,
+    `regime_split`, `threshold_objective`, `cv_method`,
+    `include_sentiment`, `period`. Internamente reutilizamos
+    `run_train` (single path con todas las capas) y al terminar cargamos
+    el pickle para devolver el dict de fold_metrics al orchestrator
+    (que calcula la AUC media para la decisión de promote).
+    """
+    import joblib
+    # `run_train` escribe el pickle y no devuelve el result en memoria,
+    # así que lo releemos desde disco. Es barato (KB).
+    out_path = kwargs.pop("out_path")
+    period = kwargs.pop("period", "5y")
+    symbols = kwargs.pop("symbols", None)
+
+    # run_train acepta exactamente estos args (ver firma arriba).
+    run_train(
+        symbol=kwargs.get("symbol", TRADING_SYMBOL),
+        period=period,
+        interval=kwargs.get("interval", "1d"),
+        out_path=out_path,
+        tp_mult=2.0,
+        sl_mult=1.5,
+        max_bars=10,
+        symbols=symbols,
+        regime_split=kwargs.get("regime_split", False),
+        threshold_objective=kwargs.get("threshold_objective", "sharpe"),
+        cv_method=kwargs.get("cv_method", "walk_forward"),
+        include_sentiment=kwargs.get("include_sentiment", False),
+    )
+    # Releer el pickle para devolver fold_metrics al orchestrator.
+    payload = joblib.load(out_path)
+    return payload
+
+
+# ═══════════════════════════════════════════════
 def run_live(
     symbol: str = TRADING_SYMBOL,
     timeframe: str = TIMEFRAME,
@@ -613,6 +714,7 @@ def run_live(
     threshold_override: Optional[float] = None,
     dry_run: bool = False,
     data_source: str = "alpaca",
+    alpaca_feed: str = "iex",
     risk_overlay: bool = False,
     target_vol: float = 0.20,
     max_daily_loss_pct: float = 0.0,
@@ -623,6 +725,15 @@ def run_live(
     max_iters: Optional[int] = None,
     sleep_seconds: Optional[int] = None,
     state_path: Optional[str] = None,
+    # ── K: Auto-retrain / drift detection ─────────────────────────
+    auto_retrain: bool = False,
+    retrain_cooldown_days: float = 7.0,
+    retrain_period: str = "5y",
+    retrain_symbols: Optional[list] = None,
+    drift_psi_strong: float = 0.25,
+    drift_auc_floor: float = 0.52,
+    drift_check_every_iters: int = 20,
+    drift_require_multi: bool = True,
 ) -> None:
     """
     Ejecuta el bot en modo live o paper trading.
@@ -737,6 +848,7 @@ def run_live(
         symbol=symbol,
         timeframe=timeframe,
         data_source=data_source,
+        alpaca_feed=alpaca_feed,
         dry_run=dry_run,
         base_position_size_pct=base_position_size_pct,
         stop_loss_pct=stop_loss_pct,
@@ -745,7 +857,77 @@ def run_live(
         sleep_seconds=sleep_seconds,
         yahoo_interval=yahoo_interval,
         state_path=state_path,
+        drift_check_every_iters=drift_check_every_iters,
+        # Si auto_retrain está activo, el LiveRunner también debe
+        # vigilar el pickle para hot-reload tras un swap.
+        model_reload_path=model_path if auto_retrain and model_path else None,
     )
+
+    # ── K: Drift detector + retrain orchestrator ───────────────────────
+    drift_detector = None
+    retrain_orchestrator = None
+    if auto_retrain:
+        if not model_path:
+            logger.error("--auto-retrain requiere --model.")
+            sys.exit(1)
+        if strategy_name != "meta_ensemble":
+            logger.warning(
+                "--auto-retrain sólo tiene sentido con strategy=meta_ensemble. "
+                "Con otra estrategia, el monitor queda desactivado."
+            )
+        else:
+            from ml.drift import DriftConfig, DriftDetector
+            from ml.retrain import RetrainConfig, RetrainOrchestrator
+
+            drift_detector = DriftDetector(DriftConfig(
+                psi_strong=drift_psi_strong,
+                auc_floor=drift_auc_floor,
+                require_multiple_signals=drift_require_multi,
+            ))
+            # Reference = features del training. Las obtenemos desde el
+            # pickle: guardamos X_reference_sample al entrenar, y si no
+            # existe, caemos a un redownload rápido (puede fallar si no
+            # hay conexión — en ese caso desactivamos el detector).
+            ref_df = _load_drift_reference(
+                model_path, symbol, strategy
+            )
+            if ref_df is not None and not ref_df.empty:
+                drift_detector.fit_reference(ref_df)
+            else:
+                logger.warning(
+                    "No pude cargar la referencia de drift; deshabilito el monitor."
+                )
+                drift_detector = None
+
+            # Orchestrator: usa el mismo run_train que el modo CLI 'train'.
+            # train_args replica los flags clave del entreno original.
+            train_args = {
+                "symbol": symbol,
+                "interval": cfg.yahoo_interval if data_source == "yahoo" else "1d",
+                "symbols": retrain_symbols or None,
+                "regime_split": bool(retrain_symbols),
+                "threshold_objective": "sharpe",
+                "cv_method": "walk_forward",
+                "include_sentiment": False,
+            }
+            retrain_orchestrator = RetrainOrchestrator(
+                model_path=model_path,
+                retrain_fn=_retrain_fn_for_orchestrator,
+                config=RetrainConfig(
+                    cooldown_days=retrain_cooldown_days,
+                    retrain_period=retrain_period,
+                    retrain_symbols=retrain_symbols or [],
+                    train_args=train_args,
+                    backup_old_pickle=True,
+                    wait_result=False,
+                    min_auc_to_promote=drift_auc_floor,
+                ),
+            )
+            logger.info(
+                "K — AUTO-RETRAIN ACTIVO (cooldown %.1fd, PSI>%.2f, AUC<%.2f, check cada %d iters)",
+                retrain_cooldown_days, drift_psi_strong, drift_auc_floor,
+                drift_check_every_iters,
+            )
 
     runner = LiveRunner(
         strategy=strategy,
@@ -755,6 +937,8 @@ def run_live(
         risk_mgr=risk_mgr,
         overlay=overlay,
         telegram_fn=telegram_fn,
+        drift_detector=drift_detector,
+        retrain_orchestrator=retrain_orchestrator,
     )
 
     if telegram_fn and not dry_run:
@@ -794,191 +978,252 @@ INTERVAL_MAX_PERIOD = {
 
 
 def main() -> None:
+    # ──────────────────────────────────────────────────────────────────
+    # Construcción del CLI con grupos lógicos para que `--help` sea
+    # legible. Cada grupo agrupa flags relacionados con un modo o capa
+    # del bot (datos, costes, ML, riesgo, live, auto-retrain, portfolio,
+    # dashboard, etc.) en lugar de aparecer todos en una lista plana.
+    # ──────────────────────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
-        description="Trading Bot -- RSI Strategy",
+        prog="trading-bot",
+        description=(
+            "Motor de trading algorítmico modular con pipeline ML completo.\n"
+            "\n"
+            "MODOS DE EJECUCIÓN (--mode):\n"
+            "  backtest   Backtest single-symbol con cualquier estrategia.\n"
+            "  portfolio  Backtest multi-símbolo con correlation guard y cap de posiciones.\n"
+            "  train      Entrena el meta-labeler LightGBM (triple-barrier + CV + threshold).\n"
+            "  features   Vuelca el DataFrame de features a parquet/csv (útil para EDA).\n"
+            "  live       Live / paper trading en Alpaca (o dry-run con yahoo).\n"
+            "  dashboard  Lanza la UI Streamlit (Live Monitor + Backtest Review + Model Inspection).\n"
+            "\n"
+            "ESTRATEGIAS (--strategy):\n"
+            "  rsi          RSI-2 Connors puro.\n"
+            "  mfi_rsi      MFI + RSI reversal (estrategia base original).\n"
+            "  donchian     Donchian channel breakout (trend-following).\n"
+            "  rsi2_mr      RSI2 mean-reversion con SMA200 filter.\n"
+            "  ensemble     Donchian trend + RSI2 mean-rev + régimen detector.\n"
+            "  meta_ensemble  Ensemble + LightGBM meta-filter (RECOMENDADA, requiere --model).\n"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Intervalos disponibles y periodo maximo de Yahoo Finance:\n"
-            "  1m         max 7 dias\n"
-            "  2m,5m,15m  max 60 dias\n"
-            "  30m,90m    max 60 dias\n"
-            "  60m / 1h   max 730 dias\n"
-            "  1d,5d      sin limite\n"
-            "  1wk,1mo    sin limite\n"
+            "INTERVALOS Y PERIODOS MÁXIMOS DE YAHOO FINANCE:\n"
+            "  1m              max 7  días\n"
+            "  2m, 5m, 15m     max 60 días\n"
+            "  30m, 90m        max 60 días\n"
+            "  60m / 1h        max 730 días (~2 años)\n"
+            "  1d, 5d          sin límite\n"
+            "  1wk, 1mo        sin límite\n"
             "\n"
-            "Ejemplos:\n"
-            "  python main.py --mode backtest --symbol AAPL --interval 1d --period 1y\n"
-            "  python main.py --mode backtest --symbol TSLA --interval 1h --period 30d\n"
-            "  python main.py --mode backtest --symbol NVDA --interval 15m --period 5d\n"
-            "  python main.py --mode backtest --symbol AMZN --interval 1m --period 5d\n"
+            "EJEMPLOS POR MODO:\n"
+            "\n"
+            "  # Backtest single-symbol con risk overlay y cost model realista\n"
+            "  python main.py --mode backtest --strategy meta_ensemble \\\n"
+            "      --model models/v1.pkl --symbol NFLX --period 5y \\\n"
+            "      --risk-overlay --target-vol 0.20 --cost-model realistic\n"
+            "\n"
+            "  # Portfolio backtest 7 símbolos con correlation guard\n"
+            "  python main.py --mode portfolio --strategy meta_ensemble \\\n"
+            "      --model models/v1.pkl \\\n"
+            "      --symbols NFLX,DIS,KO,BTC-USD,INTC,PFE,NKE \\\n"
+            "      --max-positions 4 --corr-threshold 0.75 --period 5y\n"
+            "\n"
+            "  # Train con regime split, sentiment, purged k-fold y Optuna tuning\n"
+            "  python main.py --mode train \\\n"
+            "      --symbols SPY,QQQ,AAPL,MSFT,NVDA,GOOGL,META,AMZN,TSLA \\\n"
+            "      --period 5y --regime-split --threshold-objective sharpe \\\n"
+            "      --cv-method purged_kfold --include-sentiment \\\n"
+            "      --tune-hp --tune-trials 50 --model models/v2.pkl\n"
+            "\n"
+            "  # Paper / dry-run con auto-retrain y monitor de drift\n"
+            "  python main.py --mode live --strategy meta_ensemble \\\n"
+            "      --model models/v1.pkl --symbol AAPL --data-source yahoo --dry-run \\\n"
+            "      --risk-overlay --auto-retrain --drift-check-every-iters 20 \\\n"
+            "      --state-path /tmp/live.json\n"
+            "\n"
+            "  # Dashboard Streamlit (3 páginas)\n"
+            "  python main.py --mode dashboard \\\n"
+            "      --state-path /tmp/live.json --save-result /tmp/portfolio.pkl \\\n"
+            "      --model models/v1.pkl\n"
         ),
     )
-    parser.add_argument(
+    # ── Grupos lógicos: agrupan flags por área para que --help sea legible ──
+    g_general   = parser.add_argument_group("general",        "Modo, símbolo, estrategia, período e intervalo (válidos en casi todos los modos).")
+    g_backtest  = parser.add_argument_group("backtest",       "Parámetros del modo --mode backtest (sizing, SL/TP, holding, filtros y outputs).")
+    g_costs     = parser.add_argument_group("costes",         "Modelo de costes (flat retro-compat o realistic con spread+impact). Aplica a backtest y portfolio.")
+    g_features  = parser.add_argument_group("features",       "Parámetros del modo --mode features (volcado de features para EDA).")
+    g_train     = parser.add_argument_group("train (ML)",     "Entrenamiento del meta-labeler: triple-barrier, regime split, threshold tuning, CV y sentiment.")
+    g_tune      = parser.add_argument_group("tuning Optuna",  "J — sweep de hiperparámetros LightGBM con TPE + MedianPruner antes del fit final.")
+    g_risk      = parser.add_argument_group("risk overlay",   "P6 — multiplicador dinámico del sizing (vol target + regime + confidence) y kill-switch diario.")
+    g_live      = parser.add_argument_group("live / paper",   "E — flags del modo --mode live (Alpaca o Yahoo, dry-run, sleep, snapshot para dashboard).")
+    g_retrain   = parser.add_argument_group("auto-retrain (K)", "Detección de concept drift (KS+PSI+AUC) y reentreno automático en background con cooldown.")
+    g_dashboard = parser.add_argument_group("dashboard (H)",  "H — UI Streamlit. --save-result/--state-path/--model conectan los datos.")
+    g_portfolio = parser.add_argument_group("portfolio (G)",  "G — multi-símbolo con cap de posiciones, correlation guard y sizing compartido.")
+
+    # ── general ─────────────────────────────────────────────────────────
+    g_general.add_argument(
         "--mode",
         choices=["live", "backtest", "features", "train", "portfolio", "dashboard"],
         default="backtest",
-        help="Modo de ejecucion (default: backtest). 'features' vuelca el DataFrame; 'train' entrena meta-labeler ML.",
+        help="Modo de ejecución (default: backtest). Ver descripción del programa para qué hace cada uno.",
     )
-    parser.add_argument("--symbol", default="AAPL", help="Simbolo (default: AAPL)")
-    parser.add_argument(
+    g_general.add_argument("--symbol", default="AAPL",
+                           help="Ticker single-symbol (default: AAPL). Yahoo-style: 'AAPL', 'BTC-USD', 'EURUSD=X'. Ignorado si se pasa --symbols.")
+    g_general.add_argument(
         "--strategy",
         choices=["rsi", "mfi_rsi", "donchian", "rsi2_mr", "ensemble", "meta_ensemble"],
         default="mfi_rsi",
-        help="Estrategia a usar (default: mfi_rsi). 'meta_ensemble' requiere --model.",
+        help="Estrategia a usar (default: mfi_rsi). 'meta_ensemble' es la recomendada y requiere --model.",
     )
-    parser.add_argument(
+    g_general.add_argument(
         "--period",
         default=None,
-        help="Periodo de datos (ej: 7d, 60d, 6mo, 1y, max). Si no se indica, se elige automaticamente.",
+        help="Período de datos a descargar (ej: 7d, 60d, 6mo, 1y, 5y, max). Si se omite, se infiere del intervalo (ver epílogo).",
     )
-    parser.add_argument(
+    g_general.add_argument(
         "--interval",
         default="1d",
         choices=list(INTERVAL_MAX_PERIOD.keys()),
-        help="Intervalo de vela (default: 1d)",
+        help="Granularidad de la vela Yahoo-style (default: 1d). Ver epílogo para periodos máximos.",
     )
-    # ── Parámetros de riesgo / ejecución (backtest) ──
-    parser.add_argument("--position-size-pct", type=float, default=100.0,
-                        help="Tamaño de posición como %% del capital (default: 100; usa 2.0 para replicar live)")
-    parser.add_argument("--stop-loss-pct", type=float, default=0.0,
-                        help="Stop-loss en %% del precio de entrada (default: 0 = desactivado)")
-    parser.add_argument("--take-profit-pct", type=float, default=0.0,
-                        help="Take-profit en %% del precio de entrada (default: 0 = desactivado)")
-    parser.add_argument("--slippage-pct", type=float, default=SLIPPAGE_PCT,
-                        help=f"Slippage aplicado en cada fill (default: {SLIPPAGE_PCT}%%). "
-                             f"Solo aplica al cost-model flat.")
-    parser.add_argument("--commission-pct", type=float, default=COMMISSION_PCT,
-                        help=f"Comisión por operación (default: {COMMISSION_PCT}%%). "
-                             f"Solo aplica al cost-model flat.")
-    # ── I: Cost model realista (opt-in) ──
-    parser.add_argument("--cost-model", choices=["flat", "realistic"], default="flat",
-                        help="I: modelo de costes. 'flat' (default, retro-compat) usa comisión y "
-                             "slippage constantes. 'realistic' aplica spread variable por hora del "
-                             "día + market impact raíz-cuadrática (Almgren-Chriss) sobre el ADV 20d.")
-    parser.add_argument("--commission-bps", type=float, default=1.0,
-                        help="I: comisión en basis points para cost-model=realistic (default: 1.0 bp).")
-    parser.add_argument("--spread-bps", type=float, default=4.0,
-                        help="I: spread bid-ask base en bps para cost-model=realistic (default: 4.0). "
-                             "Se multiplica por el factor horario (apertura 1.5x, medio día 1.0x, etc.).")
-    parser.add_argument("--impact-coef", type=float, default=0.1,
-                        help="I: coeficiente `k` del market impact (default: 0.1). "
-                             "impact_bps = k * 10000 * sqrt(notional/ADV). "
-                             "Con k=0.1 y participation=1%% → ~10 bps.")
-    parser.add_argument("--max-holding-bars", type=int, default=MAX_HOLDING_BARS,
-                        help="Máximo de barras en posición (0 = ilimitado)")
-    parser.add_argument("--trend-filter", action="store_true",
-                        help="Activa el filtro EMA de tendencia (solo longs cuando precio > EMA)")
-    parser.add_argument("--trend-ema", type=int, default=TREND_EMA_PERIOD,
-                        help=f"Periodo de la EMA del filtro de tendencia (default: {TREND_EMA_PERIOD})")
-    parser.add_argument("--save-trades", default=None,
-                        help="Ruta CSV donde guardar los trades del backtest")
-    parser.add_argument("--save-plot", default=None,
-                        help="Ruta (png) donde guardar el gráfico del backtest")
-    # ── Parámetros del modo features ──
-    parser.add_argument("--features-out", default=None,
-                        help="Ruta de salida del DataFrame de features (extensión .parquet / .csv)")
-    parser.add_argument("--features-no-hurst", action="store_true",
-                        help="Desactiva el cálculo del exponente de Hurst (caro en series largas)")
-    parser.add_argument("--features-no-cache", action="store_true",
-                        help="Fuerza recálculo (ignora la cache en ~/.cache/trading-bot/features/)")
-    # ── Modo train / meta_ensemble ──
-    parser.add_argument("--model", default=None,
-                        help="Ruta al modelo .pkl (entrada para --strategy meta_ensemble, salida para --mode train)")
-    parser.add_argument("--symbols", default=None,
-                        help="Lista de tickers separados por coma para --mode train (basket training). "
-                             "Ej: AAPL,MSFT,NVDA,SPY,GOOGL. Si se indica, ignora --symbol.")
-    parser.add_argument("--train-tp-mult", type=float, default=2.0,
-                        help="Multiplicador ATR del take-profit en triple-barrier (default: 2.0)")
-    parser.add_argument("--train-sl-mult", type=float, default=1.0,
-                        help="Multiplicador ATR del stop-loss en triple-barrier (default: 1.0)")
-    parser.add_argument("--train-max-bars", type=int, default=10,
-                        help="Barras máximas antes del timeout en triple-barrier (default: 10)")
-    parser.add_argument("--train-threshold", type=float, default=None,
-                        help="Override del threshold de probabilidad para meta_ensemble (default: threshold entrenado)")
-    parser.add_argument("--regime-split", action="store_true",
-                        help="P4.2: entrena dos modelos separados (trend-follow y mean-revert) "
-                             "en un único .pkl. Requiere --symbols.")
-    parser.add_argument("--threshold-objective", choices=["sharpe", "f1"], default="sharpe",
-                        help="D: criterio de elección del threshold del meta-modelo. "
-                             "'sharpe' (default) maximiza Sharpe de los retornos realizados; "
-                             "'f1' replica el comportamiento previo (max F1 de clasificación).")
-    # ── F: CV method ──
-    parser.add_argument("--cv-method", choices=["walk_forward", "purged_kfold"], default="walk_forward",
-                        help="F: método de validación cruzada del meta-labeler. "
-                             "'walk_forward' (default, expanding window con embargo). "
-                             "'purged_kfold' (López de Prado: K folds disjuntos con purging+embargo). "
-                             "purged_kfold da métricas CV más honestas pero rompe la asimetría temporal — "
-                             "útil para auditar overfit, no para deploys finales.")
-    parser.add_argument("--purge-bars", type=int, default=None,
-                        help="F: barras a purgar antes de cada test fold en --cv-method purged_kfold "
-                             "(default: igual a --train-max-bars, el horizonte del triple-barrier).")
-    # ── J: Hyperparameter tuning (Optuna) ──
-    parser.add_argument("--tune-hp", action="store_true",
-                        help="J: activa el sweep Optuna sobre los hiperparámetros de LightGBM "
-                             "antes del entrenamiento final. Usa TPE sampler + MedianPruner. "
-                             "Con --regime-split, tunea cada régimen por separado. Sin esta "
-                             "flag, se usan los defaults conservadores de MetaLabelerConfig.")
-    parser.add_argument("--tune-trials", type=int, default=50,
-                        help="J: número de combinaciones a probar en el sweep Optuna. "
-                             "Mínimo útil 30; sweet spot 50-100 (default: 50).")
-    parser.add_argument("--tune-timeout", type=int, default=None,
-                        help="J: techo en segundos para el sweep Optuna completo (default: "
-                             "None = sin límite). Útil para acotar entrenamientos largos: "
-                             "gana el primero que se alcance entre --tune-trials y --tune-timeout.")
-    # ── B: Sentiment ──
-    parser.add_argument("--include-sentiment", action="store_true",
-                        help="B: añade features de sentimiento al pipeline (VADER sobre yfinance "
-                             "news + crypto Fear & Greed). Sin keys externas. NaN para barras sin "
-                             "cobertura. La inferencia detecta automáticamente si el modelo "
-                             "guardado fue entrenado con sentiment y activa el modo correspondiente.")
-    # ── P6: Risk overlay ──
-    parser.add_argument("--risk-overlay", action="store_true",
-                        help="P6: activa el risk overlay (vol targeting + regime + confidence sizing).")
-    parser.add_argument("--target-vol", type=float, default=0.20,
-                        help="Volatilidad anualizada objetivo para el vol-targeting (default: 0.20 = 20%%).")
-    parser.add_argument("--vol-mult-cap", type=float, default=1.50,
+    # ── backtest ────────────────────────────────────────────────────────
+    g_backtest.add_argument("--position-size-pct", type=float, default=100.0,
+                            help="Tamaño de posición como %% del capital (default: 100). Usa 2.0 si quieres replicar el live.")
+    g_backtest.add_argument("--stop-loss-pct", type=float, default=0.0,
+                            help="Stop-loss en %% del precio de entrada. 0 = desactivado (default).")
+    g_backtest.add_argument("--take-profit-pct", type=float, default=0.0,
+                            help="Take-profit en %% del precio de entrada. 0 = desactivado (default).")
+    g_backtest.add_argument("--max-holding-bars", type=int, default=MAX_HOLDING_BARS,
+                            help="Máximo de barras en posición antes de salida forzada. 0 = ilimitado.")
+    g_backtest.add_argument("--trend-filter", action="store_true",
+                            help="Activa el filtro EMA de tendencia (sólo longs cuando precio > EMA(--trend-ema)).")
+    g_backtest.add_argument("--trend-ema", type=int, default=TREND_EMA_PERIOD,
+                            help=f"Periodo de la EMA del filtro de tendencia (default: {TREND_EMA_PERIOD}).")
+    g_backtest.add_argument("--save-trades", default=None,
+                            help="Path CSV para volcar los trades del backtest (opcional).")
+    g_backtest.add_argument("--save-plot", default=None,
+                            help="Path .png para guardar el gráfico equity-curve (opcional).")
+
+    # ── costes ──────────────────────────────────────────────────────────
+    g_costs.add_argument("--slippage-pct", type=float, default=SLIPPAGE_PCT,
+                         help=f"Slippage aplicado en cada fill (default: {SLIPPAGE_PCT}%%). Sólo aplica con --cost-model flat.")
+    g_costs.add_argument("--commission-pct", type=float, default=COMMISSION_PCT,
+                         help=f"Comisión por operación (default: {COMMISSION_PCT}%%). Sólo aplica con --cost-model flat.")
+    g_costs.add_argument("--cost-model", choices=["flat", "realistic"], default="flat",
+                         help="I — modelo de costes. 'flat' (default, retro-compat) usa comisión y slippage constantes. "
+                              "'realistic' aplica spread variable por hora + market impact raíz-cuadrática (Almgren-Chriss) sobre ADV 20d.")
+    g_costs.add_argument("--commission-bps", type=float, default=1.0,
+                         help="I — comisión en basis points cuando --cost-model=realistic (default: 1.0 bp, ~Alpaca/IBKR retail).")
+    g_costs.add_argument("--spread-bps", type=float, default=4.0,
+                         help="I — spread bid-ask base en bps (default: 4.0). Se multiplica por factor horario: apertura 1.5x, medio día 1.0x, cierre 1.3x.")
+    g_costs.add_argument("--impact-coef", type=float, default=0.1,
+                         help="I — coeficiente `k` del market impact (default: 0.1). impact_bps = k*10000*sqrt(notional/ADV). Con k=0.1 y participation=1%% da ~10 bps.")
+
+    # ── features ────────────────────────────────────────────────────────
+    g_features.add_argument("--features-out", default=None,
+                            help="Path de salida del DataFrame de features (.parquet o .csv).")
+    g_features.add_argument("--features-no-hurst", action="store_true",
+                            help="Desactiva el cálculo del exponente de Hurst (caro en series largas).")
+    g_features.add_argument("--features-no-cache", action="store_true",
+                            help="Fuerza recálculo (ignora la cache en ~/.cache/trading-bot/features/).")
+
+    # ── train ───────────────────────────────────────────────────────────
+    g_train.add_argument("--model", default=None,
+                         help="Path al .pkl del meta-labeler. ENTRADA para --strategy meta_ensemble; SALIDA para --mode train; entrada para dashboard --mode dashboard.")
+    g_train.add_argument("--symbols", default=None,
+                         help="Lista de tickers separados por coma para --mode train (basket training, anti-overfit). Ej: AAPL,MSFT,NVDA,SPY,GOOGL. Si se indica, ignora --symbol.")
+    g_train.add_argument("--train-tp-mult", type=float, default=2.0,
+                         help="Triple-barrier: multiplicador ATR del take-profit (default: 2.0).")
+    g_train.add_argument("--train-sl-mult", type=float, default=1.0,
+                         help="Triple-barrier: multiplicador ATR del stop-loss (default: 1.0).")
+    g_train.add_argument("--train-max-bars", type=int, default=10,
+                         help="Triple-barrier: barras máximas antes del timeout vertical (default: 10).")
+    g_train.add_argument("--train-threshold", type=float, default=None,
+                         help="Override del threshold de probabilidad meta_ensemble (default: threshold entrenado del pickle).")
+    g_train.add_argument("--regime-split", action="store_true",
+                         help="P4.2 — entrena DOS modelos separados (trend-follow y mean-revert) en un único pickle. Requiere --symbols.")
+    g_train.add_argument("--threshold-objective", choices=["sharpe", "f1"], default="sharpe",
+                         help="D — criterio del threshold del meta-modelo. 'sharpe' (default, maximiza Sharpe de retornos realizados) o 'f1' (legacy: max F1 de clasificación).")
+    g_train.add_argument("--cv-method", choices=["walk_forward", "purged_kfold"], default="walk_forward",
+                         help="F — método de CV del meta-labeler. 'walk_forward' (default, expanding+embargo) o 'purged_kfold' (López de Prado: K folds con purging+embargo, métricas más honestas pero rompe asimetría temporal).")
+    g_train.add_argument("--purge-bars", type=int, default=None,
+                         help="F — barras a purgar antes de cada test fold en purged_kfold (default: igual a --train-max-bars).")
+    g_train.add_argument("--include-sentiment", action="store_true",
+                         help="B — añade features de sentimiento al pipeline (VADER sobre yfinance news + crypto Fear&Greed). Sin keys externas; NaN para barras sin cobertura. La inferencia detecta automáticamente si el modelo fue entrenado con sentiment.")
+
+    # ── tuning Optuna ───────────────────────────────────────────────────
+    g_tune.add_argument("--tune-hp", action="store_true",
+                        help="J — activa el sweep Optuna (TPE + MedianPruner) sobre los hiperparámetros de LightGBM antes del fit final. Con --regime-split, tunea cada régimen por separado.")
+    g_tune.add_argument("--tune-trials", type=int, default=50,
+                        help="J — nº de trials del sweep (default: 50). Mínimo útil 30, sweet spot 50-100.")
+    g_tune.add_argument("--tune-timeout", type=int, default=None,
+                        help="J — techo en segundos para el sweep completo (default: sin límite). Gana el primero que se alcance entre --tune-trials y --tune-timeout.")
+
+    # ── risk overlay ────────────────────────────────────────────────────
+    g_risk.add_argument("--risk-overlay", action="store_true",
+                        help="P6 — activa el risk overlay (vol target × regime × confidence sizing) en backtest y live.")
+    g_risk.add_argument("--target-vol", type=float, default=0.20,
+                        help="Volatilidad anualizada objetivo del vol-targeting (default: 0.20 = 20%%).")
+    g_risk.add_argument("--vol-mult-cap", type=float, default=1.50,
                         help="Tope del multiplicador por vol targeting (default: 1.5 = hasta 150%% del sizing base).")
-    parser.add_argument("--max-daily-loss-pct", type=float, default=0.0,
-                        help="Kill-switch diario: si la pérdida intradía supera X%%, bloquea BUYs hasta el día siguiente. 0 = desactivado.")
-    parser.add_argument("--no-regime-sizing", action="store_true",
-                        help="Desactiva el escalado por régimen dentro del risk overlay.")
-    parser.add_argument("--no-confidence-sizing", action="store_true",
-                        help="Desactiva el escalado por confianza del meta-modelo.")
-    # ── E: Live / paper trading ──
-    parser.add_argument("--live-timeframe", default=TIMEFRAME,
-                        help=f"E: timeframe Alpaca-style para --mode live (default: {TIMEFRAME}). "
-                             f"Valores: 1Min, 5Min, 15Min, 1Hour, 1Day.")
-    parser.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca",
-                        help="E: origen de datos en --mode live. 'alpaca' (real-time, requiere creds) "
-                             "o 'yahoo' (delay 15-20m, gratis).")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="E: --mode live no envía órdenes reales (simulación con logging).")
-    parser.add_argument("--live-position-size-pct", type=float, default=2.0,
-                        help="E: % del capital por trade en --mode live (default: 2.0).")
-    parser.add_argument("--live-max-iters", type=int, default=None,
-                        help="E: limite de iteraciones (None = infinito). Útil para test.")
-    parser.add_argument("--live-sleep", type=int, default=None,
-                        help="E: override de los segundos de sleep entre iteraciones.")
-    parser.add_argument("--state-path", default=None,
-                        help="H: path de un JSON donde el LiveRunner escribe un snapshot tras cada "
-                             "iteración para que el dashboard pueda monitorizarlo en vivo.")
-    parser.add_argument("--save-result", default=None,
-                        help="H: path para persistir el resultado del backtest/portfolio (pickle). "
-                             "Útil para revisarlo después en el dashboard.")
-    parser.add_argument("--dashboard-port", type=int, default=8501,
-                        help="H: puerto para --mode dashboard (default 8501).")
-    # ── G: Portfolio (multi-symbol) ──
-    parser.add_argument("--max-positions", type=int, default=5,
-                        help="G: nº máximo de posiciones simultáneas en --mode portfolio (default: 5).")
-    parser.add_argument("--corr-threshold", type=float, default=0.75,
-                        help="G: umbral de correlación rolling media para rechazar nuevas entradas "
-                             "que solapen con las posiciones abiertas (default: 0.75). Negativo o "
-                             "muy alto desactiva el guard.")
-    parser.add_argument("--corr-window", type=int, default=60,
-                        help="G: ventana en barras para la matriz de correlación rolling (default: 60).")
-    parser.add_argument("--portfolio-position-size-pct", type=float, default=20.0,
-                        help="G: % del equity total invertido en cada nueva entrada (default: 20%%). "
-                             "Con max_positions=5 se llega a ~100%% sin apalancar.")
+    g_risk.add_argument("--max-daily-loss-pct", type=float, default=0.0,
+                        help="Kill-switch diario: si pérdida intradía > X%%, bloquea BUYs hasta el día siguiente. 0 = desactivado.")
+    g_risk.add_argument("--no-regime-sizing", action="store_true",
+                        help="Desactiva el componente regime del risk overlay (CHOP=0.5x, MEAN_REVERT=0.7x).")
+    g_risk.add_argument("--no-confidence-sizing", action="store_true",
+                        help="Desactiva el componente confidence del risk overlay (mapeo lineal proba -> multiplicador).")
+
+    # ── live / paper ────────────────────────────────────────────────────
+    g_live.add_argument("--live-timeframe", default=TIMEFRAME,
+                        help=f"E — timeframe Alpaca-style para --mode live (default: {TIMEFRAME}). Valores: 1Min, 5Min, 15Min, 1Hour, 1Day.")
+    g_live.add_argument("--data-source", choices=["alpaca", "yahoo"], default="alpaca",
+                        help="E — origen de datos en --mode live. 'alpaca' (real-time, requiere creds en config/secrets.env) o 'yahoo' (delay 15-20m, gratis, sin creds).")
+    g_live.add_argument("--alpaca-feed", choices=["iex", "sip"], default="iex",
+                        help="E — feed Alpaca para equities (default: iex = único gratis). 'sip' (consolidated tape) requiere plan de pago. Ignorado para crypto.")
+    g_live.add_argument("--dry-run", action="store_true",
+                        help="E — --mode live no envía órdenes reales: solo loguea la decisión y simula fills (útil para validar señales sin riesgo).")
+    g_live.add_argument("--live-position-size-pct", type=float, default=2.0,
+                        help="E — %% del capital por trade en --mode live (default: 2.0).")
+    g_live.add_argument("--live-max-iters", type=int, default=None,
+                        help="E — límite de iteraciones del loop live (default: None = infinito). Útil para tests cortos.")
+    g_live.add_argument("--live-sleep", type=int, default=None,
+                        help="E — override de los segundos de sleep entre iteraciones (default: derivado del timeframe).")
+    g_live.add_argument("--state-path", default=None,
+                        help="H — path de un JSON donde el LiveRunner escribe un snapshot por iteración. Lo lee el dashboard.")
+
+    # ── auto-retrain (K) ────────────────────────────────────────────────
+    g_retrain.add_argument("--auto-retrain", action="store_true",
+                           help="K — activa el monitor de drift y el reentreno automático en background. Requiere --model y --strategy meta_ensemble. Opt-in (default off).")
+    g_retrain.add_argument("--retrain-cooldown-days", type=float, default=7.0,
+                           help="K — días mínimos entre reentrenos automáticos (default: 7). Evita thrashing ante ruido estadístico.")
+    g_retrain.add_argument("--retrain-period", default="5y",
+                           help="K — período Yahoo a usar para el retrain automático (default: 5y).")
+    g_retrain.add_argument("--retrain-symbols", default=None,
+                           help="K — basket de símbolos (CSV) para el retrain automático. Si se omite, reentrena sobre el --symbol del live.")
+    g_retrain.add_argument("--drift-psi-strong", type=float, default=0.25,
+                           help="K — threshold PSI para 'drift fuerte' por feature (default: 0.25, estándar industria).")
+    g_retrain.add_argument("--drift-auc-floor", type=float, default=0.52,
+                           help="K — AUC rolling mínima aceptable del modelo en producción (default: 0.52). Por debajo, edge perdido.")
+    g_retrain.add_argument("--drift-check-every-iters", type=int, default=20,
+                           help="K — cada cuántos iters ejecutar el chequeo de drift (default: 20). Evita coste KS+PSI en cada barra.")
+    g_retrain.add_argument("--drift-single-signal", action="store_true",
+                           help="K — si se pasa, basta con UNA señal (KS, PSI o AUC) para disparar retrain. Por defecto se requieren >=2 — más conservador.")
+
+    # ── dashboard (H) ───────────────────────────────────────────────────
+    g_dashboard.add_argument("--save-result", default=None,
+                             help="H — path para persistir el resultado de backtest/portfolio (pickle). Útil para revisarlo después en el dashboard.")
+    g_dashboard.add_argument("--dashboard-port", type=int, default=8501,
+                             help="H — puerto local para --mode dashboard (default: 8501).")
+
+    # ── portfolio (G) ───────────────────────────────────────────────────
+    g_portfolio.add_argument("--max-positions", type=int, default=5,
+                             help="G — nº máximo de posiciones simultáneas en --mode portfolio (default: 5).")
+    g_portfolio.add_argument("--corr-threshold", type=float, default=0.75,
+                             help="G — umbral de correlación rolling para rechazar entradas correlacionadas (default: 0.75). >1 desactiva el guard.")
+    g_portfolio.add_argument("--corr-window", type=int, default=60,
+                             help="G — ventana en barras de la matriz de correlación rolling (default: 60).")
+    g_portfolio.add_argument("--portfolio-position-size-pct", type=float, default=20.0,
+                             help="G — %% del equity total invertido en cada nueva entrada (default: 20%%). Con max_positions=5 se llega a ~100%% sin apalancar.")
 
     args = parser.parse_args()
 
@@ -1128,6 +1373,7 @@ def main() -> None:
             threshold_override=args.train_threshold,
             dry_run=args.dry_run,
             data_source=args.data_source,
+            alpaca_feed=args.alpaca_feed,
             risk_overlay=args.risk_overlay,
             target_vol=args.target_vol,
             max_daily_loss_pct=args.max_daily_loss_pct,
@@ -1138,6 +1384,17 @@ def main() -> None:
             max_iters=args.live_max_iters,
             sleep_seconds=args.live_sleep,
             state_path=args.state_path,
+            auto_retrain=args.auto_retrain,
+            retrain_cooldown_days=args.retrain_cooldown_days,
+            retrain_period=args.retrain_period,
+            retrain_symbols=(
+                [s.strip().upper() for s in args.retrain_symbols.split(",") if s.strip()]
+                if args.retrain_symbols else None
+            ),
+            drift_psi_strong=args.drift_psi_strong,
+            drift_auc_floor=args.drift_auc_floor,
+            drift_check_every_iters=args.drift_check_every_iters,
+            drift_require_multi=(not args.drift_single_signal),
         )
 
 

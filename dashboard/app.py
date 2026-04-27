@@ -224,6 +224,49 @@ def render_live_monitor(state_path: Optional[str], refresh_seconds: int) -> None
             use_container_width=True, hide_index=True,
         )
 
+    # ── K: Drift + auto-retrain status ──
+    drift = state.get("drift") or {}
+    retrain = state.get("retrain_state") or {}
+    if drift or retrain:
+        st.markdown("**Drift monitor (K)**")
+        dcols = st.columns(5)
+        if drift:
+            _kpi(dcols[0], "KS %", f"{drift.get('ks_feature_frac', 0)*100:.1f}%")
+            _kpi(dcols[1], "PSI %", f"{drift.get('psi_feature_frac', 0)*100:.1f}%")
+            auc = drift.get("auc_rolling")
+            _kpi(dcols[2], "AUC rolling", f"{auc:.3f}" if isinstance(auc, (int, float)) else "—")
+            _kpi(dcols[3], "Should retrain", "SÍ" if drift.get("should_retrain") else "NO")
+            _kpi(dcols[4], "Reason", drift.get("reason", "—"))
+
+            # Top features con peor PSI / peor p-value KS.
+            worst_psi = drift.get("psi_worst") or []
+            worst_ks = drift.get("ks_worst") or []
+            if worst_psi:
+                st.caption("Top-5 features con mayor PSI (≥0.25 = drift):")
+                st.dataframe(
+                    pd.DataFrame(worst_psi, columns=["feature", "psi"]).round(3),
+                    use_container_width=True, hide_index=True,
+                )
+            if worst_ks:
+                st.caption("Top-5 features con p-value KS más bajo (drift distribucional):")
+                st.dataframe(
+                    pd.DataFrame(worst_ks, columns=["feature", "p_value"]).round(4),
+                    use_container_width=True, hide_index=True,
+                )
+
+        if retrain:
+            st.markdown("**Retrain orchestrator (K)**")
+            rcols = st.columns(4)
+            _kpi(rcols[0], "Retrains count", str(retrain.get("retrain_count", 0)))
+            _kpi(rcols[1], "Fallidos", str(retrain.get("failed_count", 0)))
+            _kpi(rcols[2], "Último retrain",
+                 retrain.get("last_retrain_at", "—")[:19] if retrain.get("last_retrain_at") else "—")
+            auc_last = retrain.get("last_retrain_auc")
+            _kpi(rcols[3], "AUC último",
+                 f"{auc_last:.3f}" if isinstance(auc_last, (int, float)) else "—")
+            if retrain.get("last_retrain_reason"):
+                st.caption(f"Motivo: {retrain['last_retrain_reason']}")
+
     # Auto-refresh: rerun después de `refresh_seconds`. Sólo se llama
     # cuando esta función es el "render activo" (la página actual la elige
     # por sidebar radio en `main`). Si pusiéramos esto dentro de
