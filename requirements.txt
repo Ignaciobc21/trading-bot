@@ -3,6 +3,8 @@ pandas>=2.0.0
 numpy>=1.24.0
 yfinance>=0.2.18
 ta>=0.10.2
+# Opcional para cache/vuelco de features en parquet (si falta, se usa pickle).
+pyarrow>=14.0.0
 
 # ─── Exchange / Broker ───
 # ccxt>=4.0.0
@@ -16,6 +18,31 @@ sqlalchemy>=2.0.0
 
 # ─── Backtesting ───
 matplotlib>=3.7.0
+
+# ─── Machine Learning (P4 meta-labeling) ───
+lightgbm>=4.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# ─── Sentiment (B) ─────────────────────────
+# VADER es un scorer lexicón muy ligero (~5 MB), sin GPU, perfecto para
+# titulares en inglés. Si no se instala, `--include-sentiment` produce NaN
+# en las columnas de noticias y LightGBM lo maneja sin romperse.
+vaderSentiment>=3.3.2
+
+# ─── Hyperparameter tuning (J) ─────────────
+# Optuna se usa sólo cuando --mode train --tune-hp está activo. Si no lo
+# instalas, todo el resto del bot funciona igual; sólo el flag --tune-hp
+# lanza ImportError con instrucciones claras.
+optuna>=3.5.0
+
+# ─── Dashboard (H) ─────────────────────────
+# Streamlit sirve el panel y plotly hace los charts interactivos.
+# Se invoca con `python main.py --mode dashboard`. Si no necesitas
+# el dashboard, puedes comentar estas dos deps; el resto del bot
+# funciona igual sin ellas.
+streamlit>=1.30.0
+plotly>=5.20.0
 
 # ─── Utilities ───
 python-dotenv>=1.0.0

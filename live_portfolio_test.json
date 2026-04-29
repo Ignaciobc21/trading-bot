@@ -1,0 +1,85 @@
+{
+  "schema_version": 2,
+  "updated_at": "2026-04-29T11:23:27.328981+00:00",
+  "mode": "portfolio_live",
+  "symbols": [
+    "NVDA",
+    "AAPL",
+    "MSFT"
+  ],
+  "timeframe": "1Day",
+  "strategy": "Ensemble[Donchian(20/10) + ATR\u00b73.0 | Connors RSI(2) MR + SMA200]",
+  "dry_run": true,
+  "data_source": "yahoo",
+  "iter_count": 1,
+  "max_iters": 1,
+  "max_positions": 2,
+  "corr_threshold": 0.75,
+  "n_open_positions": 0,
+  "open_symbols": [],
+  "last_decisions": [
+    {
+      "iter": 1,
+      "timestamp": "2026-04-28T00:00:00",
+      "action": "SELL",
+      "price": 213.1699981689453,
+      "size_multiplier": 1.0,
+      "proba": null,
+      "executed": false,
+      "reason": "Ensemble[Donchian(20/10) + ATR\u00b73.0 | Connors RSI(2) MR + SMA200] @ 2026-04-28 00:00:00"
+    },
+    {
+      "iter": 1,
+      "timestamp": "2026-04-28T00:00:00",
+      "action": "SELL",
+      "price": 429.25,
+      "size_multiplier": 1.0,
+      "proba": null,
+      "executed": false,
+      "reason": "Ensemble[Donchian(20/10) + ATR\u00b73.0 | Connors RSI(2) MR + SMA200] @ 2026-04-28 00:00:00"
+    },
+    {
+      "iter": 1,
+      "timestamp": "2026-04-28T00:00:00",
+      "action": "HOLD",
+      "price": 270.7099914550781,
+      "size_multiplier": 1.0,
+      "proba": null,
+      "executed": false,
+      "reason": "Ensemble[Donchian(20/10) + ATR\u00b73.0 | Connors RSI(2) MR + SMA200] @ 2026-04-28 00:00:00"
+    }
+  ],
+  "open_positions": [],
+  "history": [
+    {
+      "iter": 1,
+      "timestamp": "2026-04-28T00:00:00",
+      "action": "SELL",
+      "price": 213.1699981689453,
+      "size_multiplier": 1.0,
+      "proba": null,
+      "executed": false,
+      "reason": "Ensemble[Donchian(20/10) + ATR\u00b73.0 | Connors RSI(2) MR + SMA200] @ 2026-04-28 00:00:00"
+    },
+    {
+      "iter": 1,
+      "timestamp": "2026-04-28T00:00:00",
+      "action": "SELL",
+      "price": 429.25,
+      "size_multiplier": 1.0,
+      "proba": null,
+      "executed": false,
+      "reason": "Ensemble[Donchian(20/10) + ATR\u00b73.0 | Connors RSI(2) MR + SMA200] @ 2026-04-28 00:00:00"
+    },
+    {
+      "iter": 1,
+      "timestamp": "2026-04-28T00:00:00",
+      "action": "HOLD",
+      "price": 270.7099914550781,
+      "size_multiplier": 1.0,
+      "proba": null,
+      "executed": false,
+      "reason": "Ensemble[Donchian(20/10) + ATR\u00b73.0 | Connors RSI(2) MR + SMA200] @ 2026-04-28 00:00:00"
+    }
+  ]
+}

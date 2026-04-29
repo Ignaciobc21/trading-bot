@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-04-27T15:40:17.194259+00:00",
+  "symbol": "NVDA",
+  "timeframe": "1Day",
+  "strategy": "MetaLabeled[Ensemble[Donchian(20/10) + ATR\u00b73.0 | Connors RSI(2) MR + SMA200]] split",
+  "dry_run": false,
+  "data_source": "alpaca",
+  "iter_count": 1,
+  "max_iters": null,
+  "last_decision": {
+    "iter": 1,
+    "timestamp": "2026-04-27T04:00:00+00:00",
+    "action": "SELL",
+    "price": 210.5,
+    "size_multiplier": 1.0,
+    "proba": null,
+    "executed": false,
+    "reason": "MetaLabeled[Ensemble[Donchian(20/10) + ATR\u00b73.0 | Connors RSI(2) MR + SMA200]] split @ 2026-04-27 04:00:00+00:00"
+  },
+  "open_positions": [],
+  "model": {
+    "threshold": NaN,
+    "regime_split": true
+  },
+  "sentiment_spot": {},
+  "history": [
+    {
+      "iter": 1,
+      "timestamp": "2026-04-27T04:00:00+00:00",
+      "action": "SELL",
+      "price": 210.5,
+      "size_multiplier": 1.0,
+      "proba": null,
+      "executed": false,
+      "reason": "MetaLabeled[Ensemble[Donchian(20/10) + ATR\u00b73.0 | Connors RSI(2) MR + SMA200]] split @ 2026-04-27 04:00:00+00:00"
+    }
+  ],
+  "drift": null,
+  "retrain_state": {}
+}

@@ -1,0 +1,270 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#   TRADING-BOT · CHEATSHEET DE COMANDOS
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Este archivo recoge los comandos más útiles del bot, agrupados por modo.
+# Copia, pega y adapta los `--symbol`, `--period`, `--model`, etc. según tu caso.
+#
+# Para ver el listado completo con descripciones:
+#     python main.py --help
+#
+# Para ver SOLO los flags de una sección concreta (ej. drift):
+#     python main.py --help | grep -iA2 drift
+#
+# ---------------------------------------------------------------------------
+#   REFERENCIA RÁPIDA DE MODOS
+# ---------------------------------------------------------------------------
+#   --mode backtest   → Backtest single-symbol con cualquier estrategia.
+#   --mode portfolio  → Backtest multi-símbolo con correlation guard.
+#   --mode train      → Entrena el meta-labeler LightGBM (genera un .pkl).
+#   --mode features   → Vuelca el DataFrame de features a parquet/csv.
+#   --mode live       → Live / paper trading en Alpaca (o dry-run con yahoo).
+#   --mode dashboard  → UI Streamlit (Live Monitor + Backtest + Model Inspect).
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+# ───────────────────────────────────────────────────────────────────────────
+#   SETUP INICIAL (sólo la primera vez)
+# ───────────────────────────────────────────────────────────────────────────
+
+# Windows (Git Bash o PowerShell):
+python -m venv .venv
+. .venv/Scripts/activate           # Git Bash
+# .venv\Scripts\Activate.ps1       # PowerShell
+pip install -r requirements.txt
+
+# Linux / macOS:
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   BACKTEST · single symbol
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (1) Baseline — estrategia base MFI+RSI (sin ML)
+python main.py --mode backtest --strategy mfi_rsi \
+  --symbol AAPL --period 1y --interval 1d
+
+# (2) Ensemble de reglas (Donchian + RSI2 + régimen, sin ML)
+python main.py --mode backtest --strategy ensemble \
+  --symbol AAPL --period 5y --interval 1d
+
+# (3) RECOMENDADO — ensemble + LightGBM meta-filter + risk overlay + costes reales
+python main.py --mode backtest --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbol NFLX --period 5y --interval 1d \
+  --risk-overlay --target-vol 0.20 \
+  --cost-model realistic --commission-bps 1.0 --spread-bps 4.0 \
+  --save-result /tmp/nflx_bt.pkl \
+  --save-trades /tmp/nflx_trades.csv \
+  --save-plot  /tmp/nflx_equity.png
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   PORTFOLIO · multi-símbolo con correlation guard
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (4) Portfolio 7 símbolos, cap 4 posiciones, cost model realista
+python main.py --mode portfolio --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols NFLX,DIS,KO,BTC-USD,INTC,PFE,NKE \
+  --max-positions 4 --corr-threshold 0.75 --corr-window 60 \
+  --period 5y --interval 1d \
+  --cost-model realistic --commission-bps 1.0 --spread-bps 4.0 \
+  --save-result /tmp/portfolio.pkl
+
+# (5) Portfolio tech-heavy
+python main.py --mode portfolio --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols AAPL,MSFT,NVDA,GOOGL,META,AMZN,TSLA \
+  --max-positions 3 --corr-threshold 0.70 \
+  --period 5y
+
+# (6) Portfolio defensivo (baja volatilidad)
+python main.py --mode portfolio --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols KO,JNJ,WMT,PG,COST,UNH \
+  --max-positions 4 --corr-threshold 0.80 \
+  --period 5y
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   TRAIN · entrenar un meta-labeler nuevo
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (7) Train mínimo viable (basket pequeño, sin flags avanzados)
+python main.py --mode train \
+  --symbols SPY,QQQ,AAPL --period 5y --interval 1d \
+  --model models/quick.pkl
+
+# (8) RECOMENDADO — basket-25, regime split, threshold por Sharpe,
+#     purged k-fold, sentiment, y Optuna tuning (50 trials)
+python main.py --mode train \
+  --symbols SPY,QQQ,IWM,AAPL,MSFT,NVDA,GOOGL,META,AMZN,TSLA,JPM,BAC,GS,WMT,COST,MCD,UNH,JNJ,LLY,XOM,CVX,CAT,BA,AMD,AVGO \
+  --period 5y --interval 1d \
+  --regime-split \
+  --threshold-objective sharpe \
+  --cv-method purged_kfold \
+  --include-sentiment \
+  --tune-hp --tune-trials 50 --tune-timeout 1800 \
+  --model models/basket25_split_sent.pkl
+
+# (9) Train sólo "trend vs mean-revert" sin sentiment ni Optuna
+python main.py --mode train \
+  --symbols SPY,QQQ,AAPL,MSFT,NVDA,GOOGL,META --period 5y \
+  --regime-split --threshold-objective sharpe \
+  --model models/basket7_split.pkl
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   LIVE / PAPER TRADING
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (10) Dry-run con Yahoo (sin credenciales Alpaca, delay 15-20m)
+python main.py --mode live --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbol AAPL --live-timeframe 1Day \
+  --data-source yahoo --dry-run \
+  --live-max-iters 5 --live-sleep 5 \
+  --state-path /tmp/live.json
+
+# (11) RECOMENDADO — live con risk overlay + kill-switch + auto-retrain (K)
+python main.py --mode live --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbol AAPL --live-timeframe 1Day --data-source yahoo --dry-run \
+  --risk-overlay --target-vol 0.20 --max-daily-loss-pct 5 \
+  --auto-retrain --retrain-cooldown-days 7 \
+  --drift-psi-strong 0.25 --drift-auc-floor 0.52 \
+  --drift-check-every-iters 20 \
+  --state-path /tmp/live.json
+
+# (12) Live real en Alpaca paper (requiere ALPACA_API_KEY y ALPACA_SECRET_KEY
+#      en config/secrets.env). QUITA --dry-run para enviar órdenes de verdad.
+python main.py --mode live --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbol AAPL --live-timeframe 1Day --data-source alpaca \
+  --risk-overlay --auto-retrain \
+  --state-path /tmp/live.json
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   LIVE PORTFOLIO · multi-símbolo (nuevo)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (13) Dry-run multi-símbolo con Yahoo (sin Alpaca, validación rápida)
+python main.py --mode live --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols NVDA,AAPL,NFLX,AMZN,MSFT,GOOGL \
+  --live-timeframe 1Day --data-source yahoo --dry-run \
+  --max-positions 4 --corr-threshold 0.75 \
+  --portfolio-position-size-pct 20.0 \
+  --live-max-iters 3 --live-sleep 5 \
+  --state-path live_portfolio.json
+
+# (14) RECOMENDADO — live portfolio en Alpaca paper (7 símbolos)
+#      con risk overlay + correlation guard + cap 4 posiciones
+python main.py --mode live --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols NVDA,AAPL,NFLX,AMZN,MSFT,GOOGL \
+  --live-timeframe 1Day --data-source alpaca \
+  --max-positions 4 --corr-threshold 0.75 \
+  --portfolio-position-size-pct 20.0 \
+  --risk-overlay --target-vol 0.20 \
+  --state-path live_portfolio.json
+
+# (15) Live portfolio con crypto incluido (BTC-USD)
+python main.py --mode live --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols NVDA,AAPL,NFLX,BTC-USD,AMZN,MSFT,GOOGL \
+  --live-timeframe 1Day --data-source alpaca \
+  --max-positions 4 --corr-threshold 0.75 \
+  --portfolio-position-size-pct 20.0 \
+  --state-path live_portfolio.json
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   DASHBOARD (Streamlit)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (13) Dashboard con todo encadenado (live + backtest + modelo)
+python main.py --mode dashboard \
+  --state-path /tmp/live.json \
+  --save-result /tmp/portfolio.pkl \
+  --model models/basket25_split_sent.pkl
+
+# (14) Cambiar puerto si 8501 está ocupado
+python main.py --mode dashboard --dashboard-port 8502 \
+  --state-path /tmp/live.json
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   FEATURES (volcado de DataFrame para EDA)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (15) Dumpear features de AAPL a parquet (cache en ~/.cache/trading-bot/)
+python main.py --mode features --symbol AAPL --period 5y \
+  --features-out /tmp/aapl_features.parquet
+
+# (16) Sin Hurst (más rápido) y sin cache (fuerza recálculo)
+python main.py --mode features --symbol AAPL --period 5y \
+  --features-out /tmp/aapl_features.csv \
+  --features-no-hurst --features-no-cache
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   STRESS TESTS útiles
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (17) Comparar cost-model flat vs realistic sobre el mismo portfolio
+python main.py --mode portfolio --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols NFLX,DIS,KO,BTC-USD,INTC,PFE,NKE \
+  --max-positions 4 --period 5y \
+  --cost-model flat                                        # baseline
+# vs
+python main.py --mode portfolio --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols NFLX,DIS,KO,BTC-USD,INTC,PFE,NKE \
+  --max-positions 4 --period 5y \
+  --cost-model realistic --commission-bps 2 --spread-bps 8 # pesimista
+
+# (18) Kill-switch diario al 3 % (cerrar el día si la pérdida intradía supera 3 %)
+python main.py --mode backtest --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl --symbol NVDA --period 5y \
+  --risk-overlay --max-daily-loss-pct 3
+
+# (19) Entrenar con Optuna intensivo (100 trials, 1 h máx)
+python main.py --mode train \
+  --symbols SPY,QQQ,AAPL,MSFT,NVDA,GOOGL,META,AMZN,TSLA \
+  --period 5y --regime-split --threshold-objective sharpe \
+  --cv-method purged_kfold --include-sentiment \
+  --tune-hp --tune-trials 100 --tune-timeout 3600 \
+  --model models/tuned_long.pkl
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   TROUBLESHOOTING
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Ver la ayuda completa del CLI:
+python main.py --help
+
+# Ver sólo los flags de un grupo:
+python main.py --help | grep -iA2 drift
+python main.py --help | grep -iA2 cost-model
+
+# Si Windows se queja de codificación (UnicodeEncodeError cp1252):
+#   ya resuelto — el bot reconfigura stdout a UTF-8 al arrancar.
+#   Si aún falla, en PowerShell:
+#       $env:PYTHONIOENCODING="utf-8"
+
+# Limpiar cache de features:
+rm -rf ~/.cache/trading-bot/features/
+
+# Listar modelos disponibles:
+ls -la models/
+
+# Backtest ultra-rápido para comprobar que todo funciona:
+python main.py --mode backtest --symbol AAPL --period 1y --strategy mfi_rsi
