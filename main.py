@@ -28,7 +28,7 @@ if sys.platform == "win32":
             _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         except (AttributeError, ValueError):
             pass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -957,6 +957,145 @@ def run_live(
 
 
 # ═══════════════════════════════════════════════
+#  MODO LIVE PORTFOLIO (multi-symbol)
+# ═══════════════════════════════════════════════
+def run_live_portfolio(
+    symbols: List[str],
+    timeframe: str = TIMEFRAME,
+    strategy_name: str = "meta_ensemble",
+    model_path: Optional[str] = None,
+    threshold_override: Optional[float] = None,
+    dry_run: bool = False,
+    data_source: str = "alpaca",
+    alpaca_feed: str = "iex",
+    risk_overlay: bool = False,
+    target_vol: float = 0.20,
+    disable_confidence_sizing: bool = False,
+    position_size_pct: float = 20.0,
+    max_positions: int = 4,
+    corr_threshold: float = 0.75,
+    corr_window: int = 60,
+    stop_loss_pct: float = 0.0,
+    take_profit_pct: float = 0.0,
+    max_iters: Optional[int] = None,
+    sleep_seconds: Optional[int] = None,
+    state_path: Optional[str] = None,
+) -> None:
+    """
+    Ejecuta el bot en modo live/paper sobre MÚLTIPLES símbolos.
+
+    Un único proceso itera sobre todos los tickers, compartiendo capital
+    y respetando max_positions + correlation guard.
+
+    Args:
+        symbols             : lista de tickers (ej. ["NVDA", "AAPL", "NFLX"]).
+        max_positions       : máximo de posiciones simultáneas.
+        corr_threshold      : umbral de correlación para rechazar entradas.
+        position_size_pct   : % del equity total por entrada.
+        (resto de args: idénticos a run_live).
+    """
+    from execution.portfolio_live_runner import PortfolioLiveConfig, PortfolioLiveRunner
+    from strategies.ensemble import build_default_ensemble
+    from strategies.donchian_trend import DonchianTrendStrategy
+    from strategies.rsi2_mean_reversion import RSI2MeanReversionStrategy
+    from strategies.meta_labeled_ensemble import build_meta_labeled_ensemble_from_file
+
+    logger.info("═" * 60)
+    logger.info("  MODO LIVE PORTFOLIO — %d símbolos  strategy=%s  dry_run=%s",
+                len(symbols), strategy_name, dry_run)
+    logger.info("  Símbolos: %s", ", ".join(symbols))
+    logger.info("  Max positions: %d  Corr threshold: %.2f  Size: %.1f%%",
+                max_positions, corr_threshold, position_size_pct)
+    logger.info("═" * 60)
+
+    # ── Construir la estrategia ─────────────────────────────────────────
+    if strategy_name == "meta_ensemble":
+        if not model_path:
+            logger.error("--strategy meta_ensemble requiere --model")
+            sys.exit(1)
+        strategy = build_meta_labeled_ensemble_from_file(model_path)
+        if threshold_override is not None and hasattr(strategy, "threshold"):
+            strategy.threshold = float(threshold_override)
+    elif strategy_name == "ensemble":
+        strategy = build_default_ensemble()
+    elif strategy_name == "donchian":
+        strategy = DonchianTrendStrategy()
+    elif strategy_name == "rsi2_mr":
+        strategy = RSI2MeanReversionStrategy()
+    elif strategy_name == "mfi_rsi":
+        from strategies.mfi_rsi_strategy import MfiRsiStrategy
+        strategy = MfiRsiStrategy()
+    else:
+        from strategies.rsi_strategy import RSIStrategy
+        strategy = RSIStrategy()
+
+    # ── Broker ──────────────────────────────────────────────────────────
+    broker = None
+    if not (dry_run and data_source == "yahoo"):
+        from execution.broker import Broker
+        try:
+            broker = Broker()
+        except Exception as exc:
+            logger.error("No se pudo inicializar Broker: %s", exc)
+            if not dry_run:
+                sys.exit(1)
+
+    # ── Risk overlay (opcional) ─────────────────────────────────────────
+    overlay = None
+    if risk_overlay:
+        from risk.overlay import RiskConfig, RiskOverlay
+        overlay_cfg = RiskConfig(
+            target_vol=target_vol,
+            use_confidence_sizing=not disable_confidence_sizing,
+        )
+        overlay = RiskOverlay(config=overlay_cfg)
+        logger.info("  RISK OVERLAY ACTIVO — target_vol=%.2f", target_vol)
+
+    # ── Telegram ────────────────────────────────────────────────────────
+    try:
+        from utils.helpers import send_telegram_message
+        telegram_fn = send_telegram_message
+    except Exception:
+        telegram_fn = None
+
+    # ── Config del runner ───────────────────────────────────────────────
+    yahoo_interval = "1h" if timeframe == "1Hour" else (
+        "1d" if timeframe == "1Day" else "1h"
+    )
+
+    cfg = PortfolioLiveConfig(
+        symbols=symbols,
+        timeframe=timeframe,
+        data_source=data_source,
+        alpaca_feed=alpaca_feed,
+        dry_run=dry_run,
+        position_size_pct=position_size_pct,
+        max_positions=max_positions,
+        corr_threshold=corr_threshold,
+        corr_window=corr_window,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        max_iters=max_iters,
+        sleep_seconds=sleep_seconds,
+        yahoo_interval=yahoo_interval,
+        state_path=state_path,
+    )
+
+    runner = PortfolioLiveRunner(
+        strategy=strategy,
+        config=cfg,
+        broker=broker,
+        overlay=overlay,
+        telegram_fn=telegram_fn,
+    )
+
+    try:
+        runner.run()
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════
 #  CLI
 # ═══════════════════════════════════════════════
 
@@ -1365,37 +1504,95 @@ def main() -> None:
         logger.info("Arrancando dashboard: %s", " ".join(cmd))
         subprocess.run(cmd, check=False)
     elif args.mode == "live":
-        run_live(
-            symbol=args.symbol,
-            timeframe=args.live_timeframe,
-            strategy_name=args.strategy,
-            model_path=args.model,
-            threshold_override=args.train_threshold,
-            dry_run=args.dry_run,
-            data_source=args.data_source,
-            alpaca_feed=args.alpaca_feed,
-            risk_overlay=args.risk_overlay,
-            target_vol=args.target_vol,
-            max_daily_loss_pct=args.max_daily_loss_pct,
-            disable_confidence_sizing=args.no_confidence_sizing,
-            base_position_size_pct=args.live_position_size_pct,
-            stop_loss_pct=args.stop_loss_pct,
-            take_profit_pct=args.take_profit_pct,
-            max_iters=args.live_max_iters,
-            sleep_seconds=args.live_sleep,
-            state_path=args.state_path,
-            auto_retrain=args.auto_retrain,
-            retrain_cooldown_days=args.retrain_cooldown_days,
-            retrain_period=args.retrain_period,
-            retrain_symbols=(
-                [s.strip().upper() for s in args.retrain_symbols.split(",") if s.strip()]
-                if args.retrain_symbols else None
-            ),
-            drift_psi_strong=args.drift_psi_strong,
-            drift_auc_floor=args.drift_auc_floor,
-            drift_check_every_iters=args.drift_check_every_iters,
-            drift_require_multi=(not args.drift_single_signal),
-        )
+        # Si se pasan --symbols, usar el runner multi-símbolo (portfolio live).
+        if args.symbols:
+            symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            if len(symbols) < 2:
+                logger.warning("--symbols con 1 solo símbolo — usando runner single-symbol.")
+                # Caer al path single-symbol con ese símbolo.
+                run_live(
+                    symbol=symbols[0],
+                    timeframe=args.live_timeframe,
+                    strategy_name=args.strategy,
+                    model_path=args.model,
+                    threshold_override=args.train_threshold,
+                    dry_run=args.dry_run,
+                    data_source=args.data_source,
+                    alpaca_feed=args.alpaca_feed,
+                    risk_overlay=args.risk_overlay,
+                    target_vol=args.target_vol,
+                    max_daily_loss_pct=args.max_daily_loss_pct,
+                    disable_confidence_sizing=args.no_confidence_sizing,
+                    base_position_size_pct=args.live_position_size_pct,
+                    stop_loss_pct=args.stop_loss_pct,
+                    take_profit_pct=args.take_profit_pct,
+                    max_iters=args.live_max_iters,
+                    sleep_seconds=args.live_sleep,
+                    state_path=args.state_path,
+                    auto_retrain=args.auto_retrain,
+                    retrain_cooldown_days=args.retrain_cooldown_days,
+                    retrain_period=args.retrain_period,
+                    retrain_symbols=None,
+                    drift_psi_strong=args.drift_psi_strong,
+                    drift_auc_floor=args.drift_auc_floor,
+                    drift_check_every_iters=args.drift_check_every_iters,
+                    drift_require_multi=(not args.drift_single_signal),
+                )
+            else:
+                run_live_portfolio(
+                    symbols=symbols,
+                    timeframe=args.live_timeframe,
+                    strategy_name=args.strategy,
+                    model_path=args.model,
+                    threshold_override=args.train_threshold,
+                    dry_run=args.dry_run,
+                    data_source=args.data_source,
+                    alpaca_feed=args.alpaca_feed,
+                    risk_overlay=args.risk_overlay,
+                    target_vol=args.target_vol,
+                    disable_confidence_sizing=args.no_confidence_sizing,
+                    position_size_pct=args.portfolio_position_size_pct,
+                    max_positions=args.max_positions,
+                    corr_threshold=args.corr_threshold,
+                    corr_window=args.corr_window,
+                    stop_loss_pct=args.stop_loss_pct,
+                    take_profit_pct=args.take_profit_pct,
+                    max_iters=args.live_max_iters,
+                    sleep_seconds=args.live_sleep,
+                    state_path=args.state_path,
+                )
+        else:
+            run_live(
+                symbol=args.symbol,
+                timeframe=args.live_timeframe,
+                strategy_name=args.strategy,
+                model_path=args.model,
+                threshold_override=args.train_threshold,
+                dry_run=args.dry_run,
+                data_source=args.data_source,
+                alpaca_feed=args.alpaca_feed,
+                risk_overlay=args.risk_overlay,
+                target_vol=args.target_vol,
+                max_daily_loss_pct=args.max_daily_loss_pct,
+                disable_confidence_sizing=args.no_confidence_sizing,
+                base_position_size_pct=args.live_position_size_pct,
+                stop_loss_pct=args.stop_loss_pct,
+                take_profit_pct=args.take_profit_pct,
+                max_iters=args.live_max_iters,
+                sleep_seconds=args.live_sleep,
+                state_path=args.state_path,
+                auto_retrain=args.auto_retrain,
+                retrain_cooldown_days=args.retrain_cooldown_days,
+                retrain_period=args.retrain_period,
+                retrain_symbols=(
+                    [s.strip().upper() for s in args.retrain_symbols.split(",") if s.strip()]
+                    if args.retrain_symbols else None
+                ),
+                drift_psi_strong=args.drift_psi_strong,
+                drift_auc_floor=args.drift_auc_floor,
+                drift_check_every_iters=args.drift_check_every_iters,
+                drift_require_multi=(not args.drift_single_signal),
+            )
 
 
 if __name__ == "__main__":

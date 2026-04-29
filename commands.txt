@@ -150,6 +150,41 @@ python main.py --mode live --strategy meta_ensemble \
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#   LIVE PORTFOLIO · multi-símbolo (nuevo)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (13) Dry-run multi-símbolo con Yahoo (sin Alpaca, validación rápida)
+python main.py --mode live --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols NVDA,AAPL,NFLX,AMZN,MSFT,GOOGL \
+  --live-timeframe 1Day --data-source yahoo --dry-run \
+  --max-positions 4 --corr-threshold 0.75 \
+  --portfolio-position-size-pct 20.0 \
+  --live-max-iters 3 --live-sleep 5 \
+  --state-path live_portfolio.json
+
+# (14) RECOMENDADO — live portfolio en Alpaca paper (7 símbolos)
+#      con risk overlay + correlation guard + cap 4 posiciones
+python main.py --mode live --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols NVDA,AAPL,NFLX,AMZN,MSFT,GOOGL \
+  --live-timeframe 1Day --data-source alpaca \
+  --max-positions 4 --corr-threshold 0.75 \
+  --portfolio-position-size-pct 20.0 \
+  --risk-overlay --target-vol 0.20 \
+  --state-path live_portfolio.json
+
+# (15) Live portfolio con crypto incluido (BTC-USD)
+python main.py --mode live --strategy meta_ensemble \
+  --model models/basket25_split_sent.pkl \
+  --symbols NVDA,AAPL,NFLX,BTC-USD,AMZN,MSFT,GOOGL \
+  --live-timeframe 1Day --data-source alpaca \
+  --max-positions 4 --corr-threshold 0.75 \
+  --portfolio-position-size-pct 20.0 \
+  --state-path live_portfolio.json
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #   DASHBOARD (Streamlit)
 # ═══════════════════════════════════════════════════════════════════════════
 
