@@ -243,6 +243,21 @@ python main.py --mode train \
   --tune-hp --tune-trials 100 --tune-timeout 3600 \
   --model models/tuned_long.pkl
 
+# (20) Análisis de robustez: 16 ventanas de 6m sobre 7 símbolos
+python main.py --mode walk_forward \
+  --symbols NFLX,DIS,KO,BTC-USD,INTC,PFE,NKE \
+  --period 5y --strategy ensemble \
+  --wf-window-months 6 --wf-step-months 3 \
+  --max-positions 4 --corr-threshold 0.75
+
+# (21) Walk-forward con meta-ensemble y cost model realista
+python main.py --mode walk_forward \
+  --symbols NFLX,DIS,KO,BTC-USD,INTC,PFE,NKE \
+  --period 5y --strategy meta_ensemble --model models/basket25_split_sent.pkl \
+  --wf-window-months 6 --wf-step-months 3 \
+  --cost-model realistic --commission-bps 1.0 --spread-bps 4.0 \
+  --save-result /tmp/wf_result.pkl
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #   TROUBLESHOOTING

@@ -230,6 +230,25 @@ python main.py --mode portfolio --strategy meta_ensemble \
   --cost-model realistic --save-result /tmp/portfolio.pkl
 ```
 
+### Análisis de robustez: Walk-Forward Backtesting
+
+```bash
+# 16 ventanas de 6m sobre 7 símbolos (estrategia pura)
+python main.py --mode walk_forward \
+  --symbols NFLX,DIS,KO,BTC-USD,INTC,PFE,NKE \
+  --period 5y --strategy ensemble \
+  --wf-window-months 6 --wf-step-months 3 \
+  --max-positions 4 --corr-threshold 0.75
+
+# Con meta-ensemble y cost model realista
+python main.py --mode walk_forward \
+  --symbols NFLX,DIS,KO,BTC-USD,INTC,PFE,NKE \
+  --period 5y --strategy meta_ensemble --model models/basket25_split_sent.pkl \
+  --wf-window-months 6 --wf-step-months 3 \
+  --cost-model realistic --commission-bps 1.0 --spread-bps 4.0 \
+  --save-result /tmp/wf_result.pkl
+```
+
 ### Entrenar un modelo completo (basket-25 + regime split + Optuna + sentiment)
 
 ```bash

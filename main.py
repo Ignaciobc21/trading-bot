@@ -376,6 +376,68 @@ def run_portfolio(
 
 
 # ═══════════════════════════════════════════════
+#  MODO WALK-FORWARD (backtest ventanas deslizantes)
+# ═══════════════════════════════════════════════
+def run_walk_forward_mode(
+    symbols: list,
+    period: str,
+    interval: str,
+    strategy_name: str = "ensemble",
+    model_path=None,
+    window_months: int = 6,
+    step_months: int = 3,
+    n_windows=None,
+    mode: str = "rolling",
+    max_positions: int = 5,
+    corr_threshold: float = 0.75,
+    position_size_pct: float = 20.0,
+    cost_model_kind: str = "flat",
+    commission_bps: float = 1.0,
+    spread_bps: float = 4.0,
+    save_result=None,
+) -> None:
+    """
+    G + Walk-Forward — Backtest walk-forward multi-símbolo.
+
+    Ejecuta N backtests sobre ventanas deslizantes y muestra la
+    distribución de Sharpes para evaluar si la estrategia es robusta
+    o depende de un período concreto.
+    """
+    from backtesting.walk_forward import run_walk_forward_from_cli
+
+    logger.info("═" * 60)
+    logger.info("  MODO WALK-FORWARD — strategy=%s  symbols=%s", strategy_name, ",".join(symbols))
+    logger.info("  Ventana=%dm  Step=%dm  Modo=%s  MaxVentanas=%s",
+                window_months, step_months, mode, n_windows or "auto")
+    logger.info("═" * 60)
+
+    result = run_walk_forward_from_cli(
+        symbols=symbols,
+        period=period,
+        interval=interval,
+        strategy_name=strategy_name,
+        model_path=model_path,
+        window_months=window_months,
+        step_months=step_months,
+        n_windows=n_windows,
+        mode=mode,
+        max_positions=max_positions,
+        corr_threshold=corr_threshold,
+        position_size_pct=position_size_pct,
+        cost_model_kind=cost_model_kind,
+        commission_bps=commission_bps,
+        spread_bps=spread_bps,
+        save_result=save_result,
+    )
+
+    print(result.summary())
+    print("\nDetalle por ventana:")
+    df = result.to_dataframe()
+    print(df[["window_id","start_date","end_date","sharpe","total_return_pct",
+              "max_drawdown_pct","total_trades","win_rate"]].to_string(index=False))
+
+
+# ═══════════════════════════════════════════════
 #  MODO FEATURES  (vuelca el dataset tabular para ML)
 # ═══════════════════════════════════════════════
 def run_features(
@@ -1198,11 +1260,12 @@ def main() -> None:
     g_retrain   = parser.add_argument_group("auto-retrain (K)", "Detección de concept drift (KS+PSI+AUC) y reentreno automático en background con cooldown.")
     g_dashboard = parser.add_argument_group("dashboard (H)",  "H — UI Streamlit. --save-result/--state-path/--model conectan los datos.")
     g_portfolio = parser.add_argument_group("portfolio (G)",  "G — multi-símbolo con cap de posiciones, correlation guard y sizing compartido.")
+    g_walkfwd   = parser.add_argument_group("walk-forward",   "Análisis de robustez: distribución de Sharpes sobre ventanas deslizantes.")
 
     # ── general ─────────────────────────────────────────────────────────
     g_general.add_argument(
         "--mode",
-        choices=["live", "backtest", "features", "train", "portfolio", "dashboard"],
+        choices=["live", "backtest", "features", "train", "portfolio", "dashboard", "walk_forward"],
         default="backtest",
         help="Modo de ejecución (default: backtest). Ver descripción del programa para qué hace cada uno.",
     )
@@ -1364,6 +1427,16 @@ def main() -> None:
     g_portfolio.add_argument("--portfolio-position-size-pct", type=float, default=20.0,
                              help="G — %% del equity total invertido en cada nueva entrada (default: 20%%). Con max_positions=5 se llega a ~100%% sin apalancar.")
 
+    # ── walk-forward ────────────────────────────────────────────────────
+    g_walkfwd.add_argument("--wf-window-months", type=int, default=6,
+                           help="Tamaño de cada ventana de test en meses (default: 6).")
+    g_walkfwd.add_argument("--wf-step-months", type=int, default=3,
+                           help="Desplazamiento entre ventanas en meses (default: 3).")
+    g_walkfwd.add_argument("--wf-n-windows", type=int, default=None,
+                           help="Máximo de ventanas a evaluar (default: todas las que quepan).")
+    g_walkfwd.add_argument("--wf-mode", choices=["rolling","expanding"], default="rolling",
+                           help="Modo de ventana: 'rolling' (fija) o 'expanding' (crece desde inicio).")
+
     args = parser.parse_args()
 
     if args.mode == "backtest":
@@ -1476,6 +1549,32 @@ def main() -> None:
             commission_bps=args.commission_bps,
             spread_bps=args.spread_bps,
             impact_coef=args.impact_coef,
+        )
+    elif args.mode == "walk_forward":
+        if not args.symbols:
+            logger.error("--mode walk_forward requiere --symbols")
+            sys.exit(1)
+        period = args.period
+        if period is None:
+            period = INTERVAL_MAX_PERIOD.get(args.interval, "5y")
+        symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+        run_walk_forward_mode(
+            symbols=symbols,
+            period=period,
+            interval=args.interval,
+            strategy_name=args.strategy,
+            model_path=args.model,
+            window_months=args.wf_window_months,
+            step_months=args.wf_step_months,
+            n_windows=args.wf_n_windows,
+            mode=args.wf_mode,
+            max_positions=args.max_positions,
+            corr_threshold=args.corr_threshold,
+            position_size_pct=args.portfolio_position_size_pct,
+            cost_model_kind=args.cost_model,
+            commission_bps=args.commission_bps,
+            spread_bps=args.spread_bps,
+            save_result=args.save_result,
         )
     elif args.mode == "dashboard":
         # H — Lanza el dashboard Streamlit. El binario `streamlit` debe
