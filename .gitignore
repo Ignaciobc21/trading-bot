@@ -44,3 +44,4 @@ models/
 *_LOCAL_*.py
 *_REMOTE_*.py
 *.orig
+trading-bot-env/
